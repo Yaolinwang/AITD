@@ -113,10 +113,12 @@ http://127.0.0.1:8788/trader.html
 
 ---
 
+## 稳定梯子推荐
+https://mojie.me/#/register?code=6seDUwEZ
+
 ## 联系方式
 
 - X: [@ywa_ywa_ywa](https://x.com/ywa_ywa_ywa)
-- Telegram: [@ywa_yl](https://t.me/ywa_yl)
 
 ## 版权与使用
 
