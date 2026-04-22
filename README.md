@@ -113,8 +113,8 @@ http://127.0.0.1:8788/trader.html
 
 ---
 
-## 稳定代理推荐
-实测 中/美均可使用
+## 稳定代理推荐🪜
+实测 🇨🇳/🇺🇸 均可使用
 [MOJIE](https://mojie.me/#/register?code=6seDUwEZ)
 
 ## 联系方式
