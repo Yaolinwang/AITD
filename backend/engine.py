@@ -519,7 +519,7 @@ def build_prompt(
         "summary": "short plain-language summary",
         "position_actions": [
             {
-                "symbol": "BTCUSDT",
+                "symbol": "POSITION_SYMBOL",
                 "decision": "hold | close | reduce | update",
                 "reason": "short reason",
                 "reduceFraction": 0.25,
@@ -529,7 +529,7 @@ def build_prompt(
         ],
         "entry_actions": [
             {
-                "symbol": "ETHUSDT",
+                "symbol": "CANDIDATE_SYMBOL",
                 "action": "open",
                 "side": "long | short",
                 "confidence": 72,
@@ -540,7 +540,7 @@ def build_prompt(
         ],
         "watchlist": [
             {
-                "symbol": "SOLUSDT",
+                "symbol": "WATCHLIST_SYMBOL",
                 "reason": "why it is worth watching",
             }
         ],
@@ -563,17 +563,19 @@ def build_prompt(
             "minConfidence": settings["minConfidence"],
             "allowShorts": settings["allowShorts"],
         },
-        "marketBackdrop": market_backdrop,
         "account": account_summary,
         "openPositions": open_positions,
         "openOrders": open_orders,
         "candidates": [serialize_candidate_for_prompt(item) for item in candidates],
     }
+    if market_backdrop:
+        context["marketBackdrop"] = market_backdrop
     rules = [
         "Manage every existing position first. Existing positions should appear in position_actions.",
         "Respect existing exchange open orders and avoid duplicating protection logic that is already active.",
         f"You may propose at most {settings['maxNewPositionsPerCycle']} new entries.",
         "Do not propose entries for symbols that are not in candidates.",
+        "Summary and watchlist should only mention symbols that already exist in openPositions or candidates.",
         "Respect the hard risk limits from the system context even if the user logic asks for more.",
         "If there is no clear edge, return empty entry_actions.",
         "Return strict JSON only. No markdown, no prose outside the JSON object.",
@@ -1160,7 +1162,8 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
     warnings.extend(live_context_warnings)
     mark_to_market(book, live_by_symbol)
     protection_actions = apply_protection_hits(book, decision_id)
-    market_backdrop = fetch_market_backdrop(prompt_kline_feeds, cycle_exchange_id)
+    gateway = get_active_exchange_gateway(cycle_exchange_id)
+    market_backdrop = fetch_market_backdrop(prompt_kline_feeds, cycle_exchange_id) if gateway.default_backdrop_symbol in symbols else {}
     candidate_snapshots = []
     for opportunity in raw_candidates:
         symbol = str(opportunity.get("symbol") or "").upper()
@@ -1433,7 +1436,8 @@ def preview_trading_prompt_decision(mode_override: str | None = None, prompt_ove
     live_by_symbol, live_context_warnings = _fetch_live_contexts_for_exchange(symbols, prompt_kline_feeds, cycle_exchange_id)
     warnings.extend(live_context_warnings)
     mark_to_market(book, live_by_symbol)
-    market_backdrop = fetch_market_backdrop(prompt_kline_feeds, cycle_exchange_id)
+    gateway = get_active_exchange_gateway(cycle_exchange_id)
+    market_backdrop = fetch_market_backdrop(prompt_kline_feeds, cycle_exchange_id) if gateway.default_backdrop_symbol in symbols else {}
     candidate_snapshots = []
     for opportunity in raw_candidates:
         symbol = str(opportunity.get("symbol") or "").upper()

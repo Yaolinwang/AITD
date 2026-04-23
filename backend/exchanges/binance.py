@@ -19,7 +19,7 @@ class BinanceGateway(ExchangeGateway):
     market_label = "USDT futures"
     default_backdrop_symbol = "BTCUSDT"
     public_base_url = exchange_config("binance")["defaultBaseUrl"]
-    symbol_pattern = re.compile(r"^[A-Z0-9]{2,}USDT$")
+    symbol_pattern = re.compile(r"^[A-Z0-9]+USDT$")
     transfer_income_types = {
         "TRANSFER",
         "INTERNAL_TRANSFER",
@@ -60,7 +60,21 @@ class BinanceGateway(ExchangeGateway):
 
     def validate_symbol(self, symbol: str) -> bool:
         normalized = self.normalize_symbol(symbol)
-        return bool(self.symbol_pattern.fullmatch(normalized))
+        if not self.symbol_pattern.fullmatch(normalized):
+            return False
+        try:
+            payload = self._public_get_json(
+                "/fapi/v1/exchangeInfo",
+                namespace="exchange_info",
+                ttl_seconds=6 * 60 * 60,
+                max_stale_seconds=7 * 24 * 60 * 60,
+            )
+            symbols = payload.get("symbols") if isinstance(payload, dict) else []
+            if isinstance(symbols, list) and symbols:
+                return any(self.normalize_symbol(item.get("symbol")) == normalized for item in symbols if isinstance(item, dict))
+        except Exception:
+            pass
+        return True
 
     def base_asset_from_symbol(self, symbol: str) -> str:
         normalized = self.normalize_symbol(symbol)

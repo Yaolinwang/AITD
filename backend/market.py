@@ -46,6 +46,8 @@ def read_latest_scan(exchange_id: str | None = None) -> dict[str, Any]:
             "source": payload.get("source") or "fixed_universe",
             "exchange": str(payload.get("exchange") or normalized),
             "universeSize": int(payload.get("universeSize") or 0),
+            "skippedSymbols": payload.get("skippedSymbols") if isinstance(payload.get("skippedSymbols"), list) else [],
+            "candidateSource": payload.get("candidateSource") if isinstance(payload.get("candidateSource"), dict) else {},
             "opportunities": payload.get("opportunities") if isinstance(payload.get("opportunities"), list) else [],
         }
     return {
@@ -55,6 +57,8 @@ def read_latest_scan(exchange_id: str | None = None) -> dict[str, Any]:
         "source": "fixed_universe",
         "exchange": normalized,
         "universeSize": 0,
+        "skippedSymbols": [],
+        "candidateSource": {},
         "opportunities": [],
     }
 
