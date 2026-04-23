@@ -13,7 +13,7 @@ from .config import (
     read_prompt_settings,
     read_trading_settings,
 )
-from .exchanges import base_asset_for_symbol
+from .exchanges import base_asset_for_symbol, get_active_exchange_gateway
 from .live_trading import (
     apply_symbol_settings,
     cancel_all_open_orders,
