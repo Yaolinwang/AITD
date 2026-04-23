@@ -1803,7 +1803,7 @@ function renderPositionActionCard(action) {
   const decision = String(action?.decision || "hold").trim().toLowerCase() || "hold";
   const side = String(action?.side || "").trim().toLowerCase();
   const metrics = [];
-  if (Number.isFinite(Number(action?.reduceFraction))) {
+  if (decision === "reduce" && Number.isFinite(Number(action?.reduceFraction))) {
     metrics.push(decisionMetric("减仓比例", fmtPct(Number(action.reduceFraction) * 100, 0)));
   }
   if (Number.isFinite(Number(action?.confidence))) {

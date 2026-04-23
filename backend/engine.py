@@ -635,12 +635,15 @@ def normalize_model_decision(
         decision = str(item.get("decision") or "hold").strip().lower()
         if decision not in {"hold", "close", "reduce", "update"}:
             decision = "hold"
+        reduce_fraction = None
+        if decision == "reduce":
+            reduce_fraction = clamp(item.get("reduceFraction"), 0.05, 0.95)
         normalized_positions.append(
             {
                 "symbol": symbol,
                 "decision": decision,
                 "reason": str(item.get("reason") or ""),
-                "reduceFraction": clamp(item.get("reduceFraction"), 0.05, 0.95),
+                "reduceFraction": reduce_fraction,
                 "stopLoss": num(item.get("stopLoss")),
                 "takeProfit": num(item.get("takeProfit")),
             }
@@ -653,7 +656,7 @@ def normalize_model_decision(
                     "symbol": symbol,
                     "decision": "hold",
                     "reason": "No explicit model instruction; defaulting to hold.",
-                    "reduceFraction": 0.25,
+                    "reduceFraction": None,
                     "stopLoss": None,
                     "takeProfit": None,
                 }
