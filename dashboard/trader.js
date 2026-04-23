@@ -624,6 +624,9 @@ function liveClosedDisplaySource() {
       source: "exchange",
       records: exchangeRecords.map((trade) => ({
         symbol: trade.symbol,
+        side: trade.side || "",
+        quantity: trade.quantity,
+        notionalUsd: trade.notionalUsd,
         realizedPnl: trade.realizedPnl,
         closedAt: trade.closedAt,
         info: trade.info || "交易所已实现记录"
@@ -635,6 +638,9 @@ function liveClosedDisplaySource() {
     source: "local",
     records: localRecords.map((trade) => ({
       symbol: trade.symbol,
+      side: trade.side || "",
+      quantity: trade.quantity,
+      notionalUsd: trade.notionalUsd,
       realizedPnl: trade.realizedPnl,
       closedAt: trade.closedAt,
       info: trade.exitReason || "本地已同步平仓记录"
@@ -654,14 +660,19 @@ function groupedLiveClosedTrades() {
         symbol,
         totalRealized: 0,
         count: 0,
+        winCount: 0,
+        winRate: 0,
         latestClosedAt: null,
         trades: []
       });
     }
     const group = groups.get(symbol);
     const closedAt = trade.closedAt || null;
+    const realizedPnl = Number(trade.realizedPnl || 0);
     group.totalRealized += Number(trade.realizedPnl || 0);
     group.count += 1;
+    if (realizedPnl > 0) group.winCount += 1;
+    group.winRate = group.count ? (group.winCount / group.count) * 100 : 0;
     if (!group.latestClosedAt || compareSortValues(parseSortTime(closedAt), parseSortTime(group.latestClosedAt), "desc") < 0) {
       group.latestClosedAt = closedAt;
     }
@@ -672,6 +683,7 @@ function groupedLiveClosedTrades() {
     symbol: (item) => item.symbol,
     totalRealized: (item) => Number(item.totalRealized),
     count: (item) => Number(item.count),
+    winRate: (item) => Number(item.winRate),
     latestClosedAt: (item) => parseSortTime(item.latestClosedAt)
   };
   const getter = getters[sortState.key] || getters.latestClosedAt;
@@ -686,19 +698,50 @@ function groupedLiveClosedTrades() {
   };
 }
 
-function sortedPaperClosedTrades() {
+function groupedPaperClosedTrades() {
   const records = (activeHistory().closedTrades || []).slice();
-  const sortState = state.closedSort?.paper || { key: "closedAt", dir: "desc" };
+  const groups = new Map();
+  records.forEach((trade) => {
+    const symbol = String(trade.symbol || "").trim().toUpperCase();
+    if (!symbol) return;
+    if (!groups.has(symbol)) {
+      groups.set(symbol, {
+        symbol,
+        totalRealized: 0,
+        count: 0,
+        winCount: 0,
+        winRate: 0,
+        latestClosedAt: null,
+        trades: []
+      });
+    }
+    const group = groups.get(symbol);
+    const closedAt = trade.closedAt || null;
+    const realizedPnl = Number(trade.realizedPnl || 0);
+    group.totalRealized += realizedPnl;
+    group.count += 1;
+    if (realizedPnl > 0) group.winCount += 1;
+    group.winRate = group.count ? (group.winCount / group.count) * 100 : 0;
+    if (!group.latestClosedAt || compareSortValues(parseSortTime(closedAt), parseSortTime(group.latestClosedAt), "desc") < 0) {
+      group.latestClosedAt = closedAt;
+    }
+    group.trades.push(trade);
+  });
+  const sortState = state.closedSort?.paper || { key: "latestClosedAt", dir: "desc" };
   const getters = {
-    symbol: (item) => item.symbol || "",
-    side: (item) => item.side || "",
-    quantity: (item) => Number(item.quantity),
-    realizedPnl: (item) => Number(item.realizedPnl),
-    closedAt: (item) => parseSortTime(item.closedAt),
-    exitReason: (item) => item.exitReason || ""
+    symbol: (item) => item.symbol,
+    totalRealized: (item) => Number(item.totalRealized),
+    count: (item) => Number(item.count),
+    winRate: (item) => Number(item.winRate),
+    latestClosedAt: (item) => parseSortTime(item.latestClosedAt)
   };
-  const getter = getters[sortState.key] || getters.closedAt;
-  return records.sort((left, right) => compareSortValues(getter(left), getter(right), sortState.dir));
+  const getter = getters[sortState.key] || getters.latestClosedAt;
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      trades: group.trades.slice().sort((left, right) => compareSortValues(parseSortTime(left.closedAt), parseSortTime(right.closedAt), "desc"))
+    }))
+    .sort((left, right) => compareSortValues(getter(left), getter(right), sortState.dir));
 }
 
 function currentRunner() {
@@ -1649,6 +1692,7 @@ function renderClosedPositions() {
             <span>${sortHeaderButton("Symbol", "closed-live", "symbol", sortState, "asc")}</span>
             <span>${sortHeaderButton("Realized", "closed-live", "totalRealized", sortState, "desc")}</span>
             <span>${sortHeaderButton("Count", "closed-live", "count", sortState, "desc")}</span>
+            <span>${sortHeaderButton("Win", "closed-live", "winRate", sortState, "desc")}</span>
             <span>${sortHeaderButton("Latest", "closed-live", "latestClosedAt", sortState, "desc")}</span>
           </div>
           ${groups.map((group) => `
@@ -1658,6 +1702,7 @@ function renderClosedPositions() {
                   <strong>${escapeHtml(group.symbol)}</strong>
                   <span class="${pnlClass(group.totalRealized)}">${escapeHtml(fmtSignedUsd(group.totalRealized))}</span>
                   <span>${escapeHtml(fmtNumber(group.count, 0))}</span>
+                  <span>${escapeHtml(fmtPct(group.winRate, 0))}</span>
                   <span>${escapeHtml(fmtDateTime(group.latestClosedAt))}</span>
                 </div>
               </summary>
@@ -1665,12 +1710,18 @@ function renderClosedPositions() {
                 <div class="compact-table bare-table">
                   <div class="compact-row compact-header compact-closed-live-detail-grid">
                     <span>Closed At</span>
+                    <span>Side</span>
+                    <span>Qty</span>
+                    <span>Notional</span>
                     <span>Realized</span>
                     <span>Note</span>
                   </div>
                   ${group.trades.map((trade) => `
                     <div class="compact-row compact-closed-live-detail-grid">
                       <span>${escapeHtml(fmtDateTime(trade.closedAt))}</span>
+                      <span>${trade.side ? `<span class="mode-tag ${escapeHtml(trade.side === "short" ? "short" : "long")}">${escapeHtml(String(trade.side).toUpperCase())}</span>` : "-"}</span>
+                      <span>${Number.isFinite(Number(trade.quantity)) ? escapeHtml(fmtNumber(trade.quantity, 4)) : "-"}</span>
+                      <span>${Number.isFinite(Number(trade.notionalUsd)) ? escapeHtml(fmtUsd(trade.notionalUsd)) : "-"}</span>
                       <span class="${pnlClass(trade.realizedPnl)}">${escapeHtml(fmtSignedUsd(trade.realizedPnl))}</span>
                       <span>${escapeHtml(trade.info || "交易所已实现记录")}</span>
                     </div>
@@ -1684,10 +1735,11 @@ function renderClosedPositions() {
     `;
     return;
   }
-  const records = sortedPaperClosedTrades();
-  const sortState = state.closedSort?.paper || { key: "closedAt", dir: "desc" };
-  els.closedPositionMeta.textContent = records.length ? `${records.length} 条已平仓记录` : "当前无已平仓记录";
-  if (!records.length) {
+  const groups = groupedPaperClosedTrades();
+  const totalCount = groups.reduce((sum, group) => sum + group.count, 0);
+  const sortState = state.closedSort?.paper || { key: "latestClosedAt", dir: "desc" };
+  els.closedPositionMeta.textContent = totalCount ? `${groups.length} 个品种，${totalCount} 条已平仓记录` : "当前无已平仓记录";
+  if (!groups.length) {
     els.closedPositionList.innerHTML = `<p class="empty">模拟盘还没有已平仓记录。</p>`;
     return;
   }
@@ -1696,21 +1748,45 @@ function renderClosedPositions() {
       <div class="compact-table bare-table">
         <div class="compact-row compact-header compact-closed-paper-grid">
           <span>${sortHeaderButton("Symbol", "closed-paper", "symbol", sortState, "asc")}</span>
-          <span>${sortHeaderButton("Side", "closed-paper", "side", sortState, "asc")}</span>
-          <span>${sortHeaderButton("Qty", "closed-paper", "quantity", sortState, "desc")}</span>
-          <span>${sortHeaderButton("Realized", "closed-paper", "realizedPnl", sortState, "desc")}</span>
-          <span>${sortHeaderButton("Closed At", "closed-paper", "closedAt", sortState, "desc")}</span>
-          <span>${sortHeaderButton("Reason", "closed-paper", "exitReason", sortState, "asc")}</span>
+          <span>${sortHeaderButton("Realized", "closed-paper", "totalRealized", sortState, "desc")}</span>
+          <span>${sortHeaderButton("Count", "closed-paper", "count", sortState, "desc")}</span>
+          <span>${sortHeaderButton("Win", "closed-paper", "winRate", sortState, "desc")}</span>
+          <span>${sortHeaderButton("Latest", "closed-paper", "latestClosedAt", sortState, "desc")}</span>
         </div>
-        ${records.map((trade) => `
-          <div class="compact-row compact-closed-paper-grid">
-            <strong>${escapeHtml(trade.symbol || "n/a")}</strong>
-            <span><span class="mode-tag ${escapeHtml(trade.side === "short" ? "short" : "long")}">${escapeHtml((trade.side || "long").toUpperCase())}</span></span>
-            <span>${escapeHtml(fmtNumber(trade.quantity, 4))}</span>
-            <span class="${pnlClass(trade.realizedPnl)}">${escapeHtml(fmtSignedUsd(trade.realizedPnl))}</span>
-            <span>${escapeHtml(fmtDateTime(trade.closedAt))}</span>
-            <span>${escapeHtml(trade.exitReason || "manual")}</span>
-          </div>
+        ${groups.map((group) => `
+          <details class="trade-symbol-entry">
+            <summary>
+              <div class="compact-row bare-summary-row compact-closed-paper-grid">
+                <strong>${escapeHtml(group.symbol)}</strong>
+                <span class="${pnlClass(group.totalRealized)}">${escapeHtml(fmtSignedUsd(group.totalRealized))}</span>
+                <span>${escapeHtml(fmtNumber(group.count, 0))}</span>
+                <span>${escapeHtml(fmtPct(group.winRate, 0))}</span>
+                <span>${escapeHtml(fmtDateTime(group.latestClosedAt))}</span>
+              </div>
+            </summary>
+            <div class="trade-symbol-body">
+              <div class="compact-table bare-table">
+                <div class="compact-row compact-header compact-closed-paper-detail-grid">
+                  <span>Closed At</span>
+                  <span>Side</span>
+                  <span>Qty</span>
+                  <span>Notional</span>
+                  <span>Realized</span>
+                  <span>Reason</span>
+                </div>
+                ${group.trades.map((trade) => `
+                  <div class="compact-row compact-closed-paper-detail-grid">
+                    <span>${escapeHtml(fmtDateTime(trade.closedAt))}</span>
+                    <span><span class="mode-tag ${escapeHtml(trade.side === "short" ? "short" : "long")}">${escapeHtml((trade.side || "long").toUpperCase())}</span></span>
+                    <span>${escapeHtml(fmtNumber(trade.quantity, 4))}</span>
+                    <span>${escapeHtml(fmtUsd(trade.notionalUsd))}</span>
+                    <span class="${pnlClass(trade.realizedPnl)}">${escapeHtml(fmtSignedUsd(trade.realizedPnl))}</span>
+                    <span>${escapeHtml(trade.exitReason || "manual")}</span>
+                  </div>
+                `).join("")}
+              </div>
+            </div>
+          </details>
         `).join("")}
       </div>
     </div>

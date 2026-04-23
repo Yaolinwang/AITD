@@ -2262,22 +2262,27 @@ a:hover {
 }
 
 .compact-closed-live-grid {
-  grid-template-columns: 120px 100px 160px minmax(220px, 1fr);
+  grid-template-columns: 120px 100px 92px 88px minmax(220px, 1fr);
 }
 
 .compact-closed-paper-grid {
-  grid-template-columns: 120px 84px 90px 110px 160px minmax(180px, 1fr);
+  grid-template-columns: 120px 100px 92px 88px minmax(220px, 1fr);
 }
 
 .compact-closed-live-detail-grid {
-  grid-template-columns: 160px 110px minmax(260px, 1fr);
+  grid-template-columns: 160px 84px 90px 110px 110px minmax(220px, 1fr);
+}
+
+.compact-closed-paper-detail-grid {
+  grid-template-columns: 160px 84px 90px 110px 110px minmax(220px, 1fr);
 }
 
 .compact-closed-live-grid > strong,
 .compact-closed-live-grid > span,
 .compact-closed-live-detail-grid > span,
 .compact-closed-paper-grid > strong,
-.compact-closed-paper-grid > span {
+.compact-closed-paper-grid > span,
+.compact-closed-paper-detail-grid > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3108,6 +3113,7 @@ html[data-theme="light"] .short-tag {
   .compact-closed-live-grid,
   .compact-closed-live-detail-grid,
   .compact-closed-paper-grid,
+  .compact-closed-paper-detail-grid,
   .compact-account-grid,
   .compact-live-reconcile-grid,
   .trade-symbol-summary-grid,
