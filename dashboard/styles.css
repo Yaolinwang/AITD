@@ -2191,6 +2191,12 @@ a:hover {
   gap: 12px;
 }
 
+#closedPositionList {
+  max-height: 560px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .compact-table {
   display: grid;
   gap: 6px;

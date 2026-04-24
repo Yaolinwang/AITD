@@ -1662,10 +1662,16 @@ def reset_paper_account(mode: str = "full") -> dict[str, Any]:
         state["paper"]["initialCapitalUsd"] = settings["initialCapitalUsd"]
         state["paper"]["highWatermarkEquity"] = settings["initialCapitalUsd"]
         state["paper"]["openPositions"] = []
+        state["paper"]["openOrders"] = []
+        state["paper"]["closedTrades"] = []
+        state["paper"]["decisions"] = []
+        state["paper"]["lastDecisionAt"] = None
+        state["paper"]["sessionStartedAt"] = now_iso()
         state["paper"]["circuitBreakerTripped"] = False
         state["paper"]["circuitBreakerReason"] = None
     else:
         state["paper"] = empty_trading_account(settings["initialCapitalUsd"], "paper")
+        state["paper"]["sessionStartedAt"] = now_iso()
     state["adaptive"] = {
         "updatedAt": now_iso(),
         "notes": [
