@@ -59,6 +59,21 @@ PUBLIC_IP_PROBES = (
     ("icanhazip", "https://icanhazip.com"),
 )
 
+CLIENT_DISCONNECT_WINERRORS = {10053, 10054}
+CLIENT_DISCONNECT_ERRNOS = {32, 54, 104}
+CLIENT_DISCONNECT_EXCEPTIONS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+
+def _is_client_disconnect(error: BaseException) -> bool:
+    if isinstance(error, CLIENT_DISCONNECT_EXCEPTIONS):
+        return True
+    if not isinstance(error, OSError):
+        return False
+    winerror = getattr(error, "winerror", None)
+    if winerror in CLIENT_DISCONNECT_WINERRORS:
+        return True
+    return getattr(error, "errno", None) in CLIENT_DISCONNECT_ERRNOS
+
 
 def _prompt_lines(value: Any) -> list[str]:
     if isinstance(value, list):
@@ -679,8 +694,15 @@ class TradingAgentHandler(BaseHTTPRequestHandler):
                 return _text_response(self, "Method not allowed", status=405)
             return self._serve_static(parsed.path)
         except Exception as error:
+            if _is_client_disconnect(error):
+                return
             self.runtime.record_log("ERROR", f"{method} {parsed.path} 失败：{error}")
-            return _json_response(self, {"error": str(error)}, status=500)
+            try:
+                return _json_response(self, {"error": str(error)}, status=500)
+            except Exception as response_error:
+                if _is_client_disconnect(response_error):
+                    return
+                raise
 
     def _serve_static(self, request_path: str) -> None:
         relative = "index.html" if request_path == "/" else request_path.lstrip("/")

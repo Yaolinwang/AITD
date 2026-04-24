@@ -59,7 +59,7 @@ DEFAULT_DASHBOARD_SETTINGS = {
     "version": 1,
     "updated": "2026-04-20",
     "timezone": "Asia/Shanghai",
-    "pageAutoRefreshSeconds": 30,
+    "pageAutoRefreshSeconds": 600,
     "marketAutoScanEnabled": True,
     "marketScanIntervalMinutes": 60,
     "marketScanOffsetMinute": 7,
