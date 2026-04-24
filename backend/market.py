@@ -507,8 +507,6 @@ def normalize_prompt_kline_feeds(raw_feeds: Any) -> dict[str, dict[str, Any]]:
         }
         if not current:
             normalized[interval]["limit"] = PROMPT_KLINE_FETCH_SPECS[interval]["limit"]
-    if not any(item["enabled"] for item in normalized.values()):
-        normalized["15m"]["enabled"] = True
     return normalized
 
 

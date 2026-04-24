@@ -1167,9 +1167,6 @@ function normalizePromptKlineFeeds(value) {
       limit: Math.max(1, Math.min(300, Number(raw.limit || PROMPT_KLINE_FEED_DEFAULTS[interval].limit)))
     };
   });
-  if (!PROMPT_KLINE_FEED_OPTIONS.some((interval) => feeds[interval].enabled)) {
-    feeds["15m"].enabled = true;
-  }
   return feeds;
 }
 
@@ -1199,14 +1196,7 @@ function syncPromptKlineInputs() {
   });
 }
 
-function handlePromptKlineEnabledChange(changedInterval) {
-  const feeds = currentPromptKlineFeeds();
-  const enabledIntervals = PROMPT_KLINE_FEED_OPTIONS.filter((interval) => feeds[interval].enabled);
-  if (!enabledIntervals.length) {
-    const fallback = changedInterval && PROMPT_KLINE_FEED_OPTIONS.includes(changedInterval) ? changedInterval : "15m";
-    const fallbackInput = els.promptKlineEnabledInputs.find((input) => input.dataset.promptKlineEnabled === fallback);
-    if (fallbackInput) fallbackInput.checked = true;
-  }
+function handlePromptKlineEnabledChange() {
   syncPromptKlineInputs();
 }
 
