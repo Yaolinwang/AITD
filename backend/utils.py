@@ -6,8 +6,8 @@ import re
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
-from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime, timedelta, timezone as datetime_timezone, tzinfo
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -15,13 +15,30 @@ CONFIG_DIR = ROOT / "config"
 DATA_DIR = ROOT / "data"
 DASHBOARD_DIR = ROOT / "dashboard"
 
+FIXED_TIMEZONE_OFFSETS = {
+    "Asia/Shanghai": 8 * 60 * 60,
+    "UTC": 0,
+    "Etc/UTC": 0,
+}
+
 
 def now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _timezone_for_name(timezone_name: str) -> tzinfo:
+    normalized = str(timezone_name or "").strip() or "UTC"
+    try:
+        return ZoneInfo(normalized)
+    except ZoneInfoNotFoundError:
+        offset_seconds = FIXED_TIMEZONE_OFFSETS.get(normalized)
+        if offset_seconds is None:
+            return datetime_timezone.utc
+        return datetime_timezone(timedelta(seconds=offset_seconds), normalized)
+
+
 def current_run_date(timezone: str = "Asia/Shanghai") -> str:
-    return datetime.now(ZoneInfo(timezone)).strftime("%Y-%m-%d")
+    return datetime.now(_timezone_for_name(timezone)).strftime("%Y-%m-%d")
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -93,4 +110,3 @@ def parse_json_loose(raw_text: str) -> Any:
     if brace_match:
         return json.loads(brace_match.group(1))
     raise ValueError("could not find JSON object in response")
-
