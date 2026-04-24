@@ -113,9 +113,10 @@ http://127.0.0.1:8788/trader.html
 
 ---
 
-## 稳定代理推荐🪜
-实测 🇨🇳/🇺🇸 均可使用：[MOJIE](https://mojie.me/#/register?code=6seDUwEZ)
-
+## 稳定代理/中转推荐🪜
+- 机场：实测 🇨🇳/🇺🇸 均可使用：[MOJIE](https://mojie.me/#/register?code=6seDUwEZ)
+- Claude中转 量大管饱：[XueDing](https://shop.xuedingtoken.com/?dist=KHUFWYRJ)
+  
 ## 联系方式
 
 - X: [@ywa_ywa_ywa](https://x.com/ywa_ywa_ywa)
