@@ -805,13 +805,19 @@ function latestScanOpportunities() {
 
 function buildEquitySeries() {
   const account = activeAccount();
+  const history = activeHistory();
   const book = activeBook();
-  const decisions = Array.isArray(book?.decisions) ? book.decisions : [];
+  const decisions = Array.isArray(history?.decisionTimeline) && history.decisionTimeline.length
+    ? history.decisionTimeline
+    : (Array.isArray(book?.decisions) ? book.decisions : []);
   const intervalMinutes = Math.max(1, Number(state.tradingSettings?.decisionIntervalMinutes || 5));
   const initial = Number(account.initialCapitalUsd || 0);
   const pointsBySlot = new Map();
   decisions.forEach((decision) => {
-    const equity = Number(decision?.accountAfter?.equityUsd);
+    const equity = Number(
+      decision?.equityUsd
+      ?? decision?.accountAfter?.equityUsd
+    );
     const actualAt = decision?.finishedAt || decision?.startedAt || null;
     const actualMs = parseTimeMs(actualAt);
     if (!Number.isFinite(equity) || actualMs === null) return;
