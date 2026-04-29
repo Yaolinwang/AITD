@@ -19,6 +19,7 @@
         <span id="tradeRefreshHint" class="refresh-hint">自动刷新中</span>
         <div class="top-actions-row">
           <button id="toggleModeBtn" type="button" class="secondary-button">查看实盘</button>
+          <button id="cloneLiveBtn" type="button" class="secondary-button" hidden>克隆为实盘</button>
           <button id="flattenBtn" type="button" class="secondary-button">全部平仓</button>
           <button id="resetBtn" type="button" class="secondary-button danger-outline" hidden>重置模拟盘</button>
         </div>
@@ -115,6 +116,10 @@
               页面自动刷新（秒）
               <input id="pageAutoRefreshInput" type="number" min="10" max="600" step="5">
             </label>
+            <label class="check-row settings-full-row">
+              <input id="selfLearningEnabledInput" type="checkbox">
+              <span>启用自学习经验注入</span>
+            </label>
             <div class="settings-actions">
               <button id="saveTradingSettingsBtn" type="button">保存运行设置</button>
             </div>
@@ -188,6 +193,7 @@
               <select id="providerPresetInput">
                 <option value="gpt">GPT / OpenAI</option>
                 <option value="claude">Claude / Anthropic</option>
+                <option value="kimi">Kimi / Moonshot</option>
                 <option value="deepseek">DeepSeek</option>
                 <option value="qwen">Qwen</option>
                 <option value="custom">Custom</option>
@@ -215,6 +221,10 @@
             <label>
               API Key
               <input id="providerApiKeyInput" type="password" placeholder="sk-...">
+            </label>
+            <label class="check-row">
+              <input id="providerBypassProxyInput" type="checkbox">
+              <span>LLM 调用不走代理</span>
             </label>
             <div class="settings-actions">
               <button id="providerAdvancedToggleBtn" type="button" class="secondary-button">展开高级参数</button>
@@ -268,6 +278,7 @@
       <section class="trader-main">
         <div class="trader-tabs" role="tablist" aria-label="Trader main tabs">
           <button type="button" class="tab-button active" data-tab-button="trade" role="tab" aria-selected="true">交易</button>
+          <button type="button" class="tab-button" data-tab-button="learning" role="tab" aria-selected="false">学习</button>
           <button type="button" class="tab-button" data-tab-button="prompt" role="tab" aria-selected="false">Prompt</button>
           <button type="button" class="tab-button" data-tab-button="universe" role="tab" aria-selected="false">候选池</button>
           <button type="button" class="tab-button" data-tab-button="log" role="tab" aria-selected="false">Log</button>
@@ -312,6 +323,16 @@
               <p id="decisionMeta" class="meta">最近几轮 prompt、模型输出与动作</p>
             </div>
             <div id="decisionLog" class="decision-log"></div>
+          </section>
+        </div>
+
+        <div class="trader-tab-panel" data-tab-panel="learning" hidden>
+          <section class="trader-section">
+            <div class="section-heading">
+              <h2>自学习经验</h2>
+              <p id="learningMeta" class="meta">等待最近决策</p>
+            </div>
+            <div id="learningPanel" class="learning-panel"></div>
           </section>
         </div>
 

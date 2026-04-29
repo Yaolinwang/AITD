@@ -8,6 +8,9 @@ venv/
 .mypy_cache/
 data/cache/
 data/scans/
+data/scan-archive/
+data/instances/
+data/exchange_cooldowns.json
 data/trading-agent/decisions/
 data/trading_agent_state.json
 data/logs/

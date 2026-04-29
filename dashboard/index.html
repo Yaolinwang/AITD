@@ -2,11 +2,39 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta http-equiv="refresh" content="0; url=/trader.html">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trading Agent</title>
+    <title>AITD Workbench</title>
+    <script>
+      try {
+        const theme = window.localStorage.getItem("gs-ai-trader-theme") || "dark";
+        document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
+      } catch {}
+    </script>
+    <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <p>Redirecting to <a href="/trader.html">/trader.html</a>...</p>
+    <header class="topbar workbench-topbar">
+      <div class="title-block workbench-brand">
+        <img class="workbench-logo" src="/assets/aitd-readme-header.png" alt="AITD - AI Trading Agent for Everyone">
+        <p class="meta" id="workbenchMeta">读取实例列表中…</p>
+      </div>
+      <div class="header-actions workbench-header-actions">
+        <span class="refresh-hint">多实例工作台</span>
+      </div>
+    </header>
+
+    <main class="workbench-shell">
+      <section class="workbench-summary" id="workbenchSummary"></section>
+      <section class="workbench-actions-row">
+        <div class="workbench-actions">
+          <button id="createPaperBtn" type="button">新建模拟盘</button>
+          <button id="createLiveBtn" type="button" class="secondary-button">新建实盘</button>
+          <button id="refreshWorkbenchBtn" type="button" class="secondary-button">刷新</button>
+        </div>
+      </section>
+      <section class="workbench-grid" id="instanceGrid"></section>
+    </main>
+
+    <script src="/index.js" type="module"></script>
   </body>
 </html>

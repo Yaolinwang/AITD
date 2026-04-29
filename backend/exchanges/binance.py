@@ -7,6 +7,12 @@ from typing import Any
 from urllib.parse import urlencode
 
 from ..config import read_live_trading_config, read_network_settings
+from ..exchange_cooldown import (
+    cooldown_status,
+    is_exchange_rate_limit_error,
+    raise_if_exchange_cooldown_active,
+    record_exchange_cooldown,
+)
 from ..http_client import HttpRequestError, cached_get_json, request_json
 from ..utils import clamp, now_iso, num
 from .base import ExchangeGateway
@@ -113,14 +119,21 @@ class BinanceGateway(ExchangeGateway):
     ) -> Any:
         network_settings = read_network_settings()
         url = self._query(self.public_base_url, endpoint, params)
-        return cached_get_json(
-            url,
-            namespace=f"binance_{namespace}",
-            ttl_seconds=ttl_seconds,
-            max_stale_seconds=max_stale_seconds,
-            timeout_seconds=45,
-            network_settings=network_settings,
-        )
+        cooldown = cooldown_status(self.exchange_id)
+        try:
+            return cached_get_json(
+                url,
+                namespace=f"binance_{namespace}",
+                ttl_seconds=ttl_seconds,
+                max_stale_seconds=max_stale_seconds,
+                timeout_seconds=45,
+                network_settings=network_settings,
+                prefer_cache=bool(cooldown.get("active")),
+                allow_network=not bool(cooldown.get("active")),
+            )
+        except HttpRequestError as error:
+            self._record_cooldown_from_error(error, f"GET {endpoint}")
+            raise
 
     def _parse_klines(self, rows: list[list[Any]] | None) -> list[dict[str, Any]]:
         parsed: list[dict[str, Any]] = []
@@ -215,10 +228,13 @@ class BinanceGateway(ExchangeGateway):
     ) -> dict[str, Any]:
         live_config = live_config or read_live_trading_config()
         issues = []
+        cooldown = cooldown_status(self.exchange_id)
         if not live_config.get("apiKey"):
             issues.append("Live trading API key is missing.")
         if not live_config.get("apiSecret"):
             issues.append("Live trading API secret is missing.")
+        if cooldown.get("active"):
+            issues.append(cooldown.get("message") or "Binance API cooldown is active.")
         resolved_position_mode = "hedge" if str(live_config.get("positionMode") or "").strip().lower() == "hedge" else "oneway"
         if not issues:
             try:
@@ -238,7 +254,18 @@ class BinanceGateway(ExchangeGateway):
             "baseUrl": self.resolved_base_url(live_config),
             "exchange": self.exchange_id,
             "positionMode": resolved_position_mode,
+            "cooldown": cooldown,
         }
+
+    def _record_cooldown_from_error(self, error: Any, endpoint: str) -> None:
+        if not is_exchange_rate_limit_error(error):
+            return
+        record_exchange_cooldown(
+            self.exchange_id,
+            error,
+            retry_after=getattr(error, "retry_after", None),
+            endpoint=endpoint,
+        )
 
     def _signed_params(self, config: dict[str, Any], params: dict[str, Any] | None = None) -> str:
         payload = dict(params or {})
@@ -255,12 +282,16 @@ class BinanceGateway(ExchangeGateway):
     def _sync_server_time_offset(self, config: dict[str, Any]) -> None:
         network_settings = read_network_settings()
         base_url = self.resolved_base_url(config).rstrip("/")
-        payload = request_json(
-            "GET",
-            f"{base_url}/fapi/v1/time",
-            timeout_seconds=10,
-            network_settings=network_settings,
-        )
+        try:
+            payload = request_json(
+                "GET",
+                f"{base_url}/fapi/v1/time",
+                timeout_seconds=10,
+                network_settings=network_settings,
+            )
+        except HttpRequestError as error:
+            self._record_cooldown_from_error(error, "GET /fapi/v1/time")
+            raise
         server_time = num(payload.get("serverTime")) if isinstance(payload, dict) else None
         local_time = int(__import__("time").time() * 1000)
         if server_time is not None:
@@ -273,6 +304,7 @@ class BinanceGateway(ExchangeGateway):
         endpoint: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
+        raise_if_exchange_cooldown_active(self.exchange_id)
         network_settings = read_network_settings()
         base_url = self.resolved_base_url(config).rstrip("/")
         headers_base = {"X-MBX-APIKEY": config["apiKey"]}
@@ -305,20 +337,35 @@ class BinanceGateway(ExchangeGateway):
         except HttpRequestError as error:
             if "-1021" in str(error):
                 self._sync_server_time_offset(config)
-                return send_once()
+                try:
+                    return send_once()
+                except HttpRequestError as retry_error:
+                    error = retry_error
+            self._record_cooldown_from_error(error, f"{method.upper()} {endpoint}")
+            if is_exchange_rate_limit_error(error):
+                cooldown = cooldown_status(self.exchange_id)
+                suffix = f" | {cooldown.get('message')}" if cooldown.get("active") else ""
+                raise HttpRequestError(f"{error}{suffix} [endpoint {method.upper()} {endpoint}]") from error
             raise HttpRequestError(f"{error} [endpoint {method.upper()} {endpoint}]") from error
 
     def _exchange_info(self, config: dict[str, Any]) -> dict[str, Any]:
         network_settings = read_network_settings()
         url = f"{self.resolved_base_url(config).rstrip('/')}/fapi/v1/exchangeInfo"
-        payload = cached_get_json(
-            url,
-            namespace="binance_live_exchange_info",
-            ttl_seconds=6 * 60 * 60,
-            max_stale_seconds=7 * 24 * 60 * 60,
-            timeout_seconds=45,
-            network_settings=network_settings,
-        )
+        cooldown = cooldown_status(self.exchange_id)
+        try:
+            payload = cached_get_json(
+                url,
+                namespace="binance_live_exchange_info",
+                ttl_seconds=6 * 60 * 60,
+                max_stale_seconds=7 * 24 * 60 * 60,
+                timeout_seconds=45,
+                network_settings=network_settings,
+                prefer_cache=bool(cooldown.get("active")),
+                allow_network=not bool(cooldown.get("active")),
+            )
+        except HttpRequestError as error:
+            self._record_cooldown_from_error(error, "GET /fapi/v1/exchangeInfo")
+            raise
         return payload if isinstance(payload, dict) else {}
 
     def _symbol_info(self, config: dict[str, Any], symbol: str) -> dict[str, Any]:
@@ -398,21 +445,68 @@ class BinanceGateway(ExchangeGateway):
                 return {"ignored": True}
             raise
 
-    def _income_summary(self, config: dict[str, Any]) -> dict[str, Any]:
+    def _income_history(
+        self,
+        config: dict[str, Any],
+        *,
+        start_time: int,
+        end_time: int,
+        income_type: str | None = None,
+        limit: int = 1000,
+        max_pages: int = 8,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        entries: list[dict[str, Any]] = []
+        seen_keys: set[tuple[Any, ...]] = set()
+        hit_cap = False
+        page = 1
+        while page <= max_pages:
+            params: dict[str, Any] = {
+                "startTime": start_time,
+                "endTime": end_time,
+                "limit": limit,
+                "page": page,
+            }
+            if income_type:
+                params["incomeType"] = income_type
+            rows = self._signed_request_json(config, "GET", "/fapi/v1/income", params)
+            batch = rows if isinstance(rows, list) else []
+            if not batch:
+                break
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                dedupe_key = (
+                    row.get("tranId"),
+                    row.get("tradeId"),
+                    row.get("time"),
+                    row.get("incomeType"),
+                    row.get("symbol"),
+                    row.get("income"),
+                    row.get("asset"),
+                    row.get("info"),
+                )
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                entries.append(row)
+            if len(batch) < limit:
+                break
+            page += 1
+        if page > max_pages and len(batch) >= limit:
+            hit_cap = True
+        return entries, hit_cap
+
+    def _income_summary(self, config: dict[str, Any], session_started_at: str | None = None) -> dict[str, Any]:
         limit = 1000
         now_ms = int(__import__("time").time() * 1000)
-        ninety_days_ms = 90 * 24 * 60 * 60 * 1000
-        rows = self._signed_request_json(
+        session_start_ms = self._session_start_ms(session_started_at) or now_ms
+        entries, hit_cap = self._income_history(
             config,
-            "GET",
-            "/fapi/v1/income",
-            {
-                "startTime": now_ms - ninety_days_ms,
-                "endTime": now_ms,
-                "limit": limit,
-            },
+            start_time=session_start_ms,
+            end_time=now_ms,
+            limit=limit,
+            max_pages=8,
         )
-        entries = rows if isinstance(rows, list) else []
         net_cashflow = 0.0
         realized_pnl = 0.0
         funding_fee = 0.0
@@ -434,8 +528,8 @@ class BinanceGateway(ExchangeGateway):
             else:
                 other_income += income_value
         note = None
-        if len(entries) >= limit:
-            note = "Binance income history hit the 1000-row sync cap; very active accounts may need a deeper backfill."
+        if hit_cap:
+            note = "Binance income history still hit the paginated sync cap; very active accounts may need a deeper backfill."
         return {
             "netCashflowUsd": net_cashflow,
             "incomeRealizedPnlUsd": realized_pnl,
@@ -460,18 +554,30 @@ class BinanceGateway(ExchangeGateway):
         session_start_ms = self._session_start_ms(session_started_at)
         if session_start_ms is None:
             return []
-        rows = self._signed_request_json(
+        entries, _ = self._income_history(
             config,
-            "GET",
-            "/fapi/v1/income",
-            {
-                "incomeType": "REALIZED_PNL",
-                "startTime": session_start_ms,
-                "endTime": int(__import__("time").time() * 1000),
-                "limit": 1000,
-            },
+            start_time=session_start_ms,
+            end_time=int(__import__("time").time() * 1000),
+            income_type="REALIZED_PNL",
+            limit=1000,
+            max_pages=8,
         )
-        entries = rows if isinstance(rows, list) else []
+        symbols = sorted({
+            self.normalize_symbol(row.get("symbol"))
+            for row in entries
+            if isinstance(row, dict) and self.normalize_symbol(row.get("symbol"))
+        })
+        trade_rows = self._user_trade_history(config, symbols, session_start_ms)
+        if trade_rows:
+            closed_trades = [
+                self._closed_trade_from_user_trade(row)
+                for row in trade_rows
+                if isinstance(row, dict)
+            ]
+            closed_trades = [item for item in closed_trades if item]
+            closed_trades.sort(key=lambda item: str(item.get("closedAt") or ""))
+            return closed_trades
+
         closed_trades: list[dict[str, Any]] = []
         for row in entries:
             if not isinstance(row, dict):
@@ -494,12 +600,93 @@ class BinanceGateway(ExchangeGateway):
                     "realizedPnl": realized_pnl,
                     "asset": str(row.get("asset") or "USDT").strip().upper() or "USDT",
                     "closedAt": closed_at,
-                    "info": str(row.get("info") or "").strip(),
+                    "info": "仅同步到已实现收益，未匹配到成交明细",
                     "source": "binance_realized_pnl",
                 }
             )
         closed_trades.sort(key=lambda item: str(item.get("closedAt") or ""))
         return closed_trades
+
+    def _user_trade_history(
+        self,
+        config: dict[str, Any],
+        symbols: list[str],
+        session_start_ms: int,
+    ) -> list[dict[str, Any]]:
+        now_ms = int(__import__("time").time() * 1000)
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[tuple[str, str]] = set()
+        for symbol in symbols:
+            normalized = self.normalize_symbol(symbol)
+            if not normalized:
+                continue
+            payload = self._signed_request_json(
+                config,
+                "GET",
+                "/fapi/v1/userTrades",
+                {
+                    "symbol": normalized,
+                    "startTime": session_start_ms,
+                    "endTime": now_ms,
+                    "limit": 1000,
+                },
+            )
+            batch = payload if isinstance(payload, list) else []
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                realized_pnl = num(row.get("realizedPnl"))
+                if realized_pnl is None or abs(realized_pnl) <= 1e-12:
+                    continue
+                trade_id = str(row.get("id") or row.get("tradeId") or "").strip()
+                dedupe_key = (normalized, trade_id or f"{row.get('time')}-{row.get('orderId')}")
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+                rows.append(row)
+        rows.sort(key=lambda item: num(item.get("time")) or 0)
+        return rows
+
+    def _closed_trade_from_user_trade(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        symbol = self.normalize_symbol(row.get("symbol"))
+        if not symbol:
+            return None
+        realized_pnl = num(row.get("realizedPnl"))
+        if realized_pnl is None or abs(realized_pnl) <= 1e-12:
+            return None
+        price = num(row.get("price")) or 0
+        quantity = abs(num(row.get("qty")) or 0)
+        notional_usd = num(row.get("quoteQty"))
+        if notional_usd is None and price > 0 and quantity > 0:
+            notional_usd = price * quantity
+        closed_at_ms = num(row.get("time"))
+        closed_at = (
+            __import__("datetime").datetime.utcfromtimestamp(closed_at_ms / 1000).replace(microsecond=0).isoformat() + "Z"
+            if closed_at_ms is not None
+            else now_iso()
+        )
+        raw_position_side = str(row.get("positionSide") or "").strip().upper()
+        raw_side = str(row.get("side") or "").strip().upper()
+        if raw_position_side == "LONG":
+            side = "long"
+        elif raw_position_side == "SHORT":
+            side = "short"
+        else:
+            side = "long" if raw_side == "SELL" else "short"
+        return {
+            "id": f"binance-trade-{row.get('id') or row.get('tradeId') or symbol}-{int(closed_at_ms or 0)}",
+            "symbol": symbol,
+            "baseAsset": self.base_asset_from_symbol(symbol),
+            "side": side,
+            "quantity": quantity,
+            "exitPrice": price,
+            "notionalUsd": abs(notional_usd or 0),
+            "realizedPnl": realized_pnl,
+            "asset": str(row.get("commissionAsset") or "USDT").strip().upper() or "USDT",
+            "closedAt": closed_at,
+            "info": "交易所成交明细",
+            "source": "binance_user_trade",
+        }
 
     def apply_symbol_settings(self, config: dict[str, Any], symbol: str) -> None:
         leverage = int(clamp(config.get("defaultLeverage"), 1, 125))
@@ -531,7 +718,7 @@ class BinanceGateway(ExchangeGateway):
             "accountingNote": None,
         }
         try:
-            accounting_summary.update(self._income_summary(config))
+            accounting_summary.update(self._income_summary(config, session_started_at=session_started_at))
         except Exception as error:
             accounting_summary["accountingNote"] = f"Binance income sync failed: {error}"
         exchange_closed_trades: list[dict[str, Any]] = []
@@ -673,6 +860,7 @@ class BinanceGateway(ExchangeGateway):
             "side": str(side or "").upper(),
             "type": "MARKET",
             "quantity": quantity,
+            "newOrderRespType": "RESULT",
         }
         if self._resolved_position_mode(config) == "hedge":
             if params["side"] == "BUY":
@@ -689,8 +877,10 @@ class BinanceGateway(ExchangeGateway):
         *,
         symbol: str,
         position_side: str,
+        quantity: float | None = None,
         stop_loss: float | None,
         take_profit: float | None,
+        take_profit_fraction: float | None = None,
     ) -> list[dict[str, Any]]:
         created: list[dict[str, Any]] = []
         if stop_loss is None and take_profit is None:
@@ -720,15 +910,37 @@ class BinanceGateway(ExchangeGateway):
                 )
             )
         if take_profit is not None:
+            tp_fraction = max(0.05, min(1.0, num(take_profit_fraction) or 1.0))
             take_profit_order = {
                 "algoType": "CONDITIONAL",
                 "symbol": normalized,
                 "side": close_side,
                 "type": "TAKE_PROFIT_MARKET",
                 "triggerPrice": self.normalize_price(config, normalized, take_profit),
-                "closePosition": "true",
                 "workingType": "MARK_PRICE",
             }
+            if tp_fraction >= 0.999 or not quantity:
+                take_profit_order["closePosition"] = "true"
+            else:
+                try:
+                    tp_quantity = self.normalize_quantity(
+                        config,
+                        normalized,
+                        quantity=(num(quantity) or 0) * tp_fraction,
+                    )
+                    total_quantity = self.normalize_quantity(
+                        config,
+                        normalized,
+                        quantity=num(quantity),
+                    )
+                except ValueError as error:
+                    if "below exchange minimum" in str(error):
+                        return created
+                    raise
+                if tp_quantity <= 0 or tp_quantity >= total_quantity:
+                    take_profit_order["closePosition"] = "true"
+                else:
+                    take_profit_order["quantity"] = tp_quantity
             if hedge_mode:
                 take_profit_order["positionSide"] = exchange_position_side
             created.append(

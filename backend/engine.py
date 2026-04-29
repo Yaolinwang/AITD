@@ -3,16 +3,21 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from .config import (
     read_fixed_universe,
     read_live_trading_config,
     read_llm_provider,
+    read_network_settings,
     read_prompt_settings,
     read_trading_settings,
 )
+from .exchange_cooldown import cooldown_status
 from .exchanges import base_asset_for_symbol, get_active_exchange_gateway
+from .evolution import historical_lessons_for_prompt
+from .instances import instance_paths, read_instance
 from .live_trading import (
     apply_symbol_settings,
     cancel_all_open_orders,
@@ -22,7 +27,7 @@ from .live_trading import (
     place_market_order,
     place_protection_orders,
 )
-from .llm import generate_trading_decision, provider_status
+from .llm import ModelDecisionParseError, generate_trading_decision, provider_status
 from .market import (
     build_candidate_snapshot,
     candidate_universe_from_scan,
@@ -36,6 +41,18 @@ from .utils import DATA_DIR, clamp, current_run_date, now_iso, num, one_line, re
 
 STATE_PATH = DATA_DIR / "trading_agent_state.json"
 DECISIONS_DIR = DATA_DIR / "trading-agent" / "decisions"
+
+
+def _state_path(instance_id: str | None = None) -> Path:
+    if instance_id:
+        return instance_paths(instance_id)["state"]
+    return STATE_PATH
+
+
+def _decisions_dir(instance_id: str | None = None) -> Path:
+    if instance_id:
+        return instance_paths(instance_id)["decisions_dir"]
+    return DECISIONS_DIR
 
 
 def clean_mode(value: Any) -> str:
@@ -53,6 +70,18 @@ def enabled_modes(settings: dict[str, Any]) -> list[str]:
     if settings.get("liveTrading", {}).get("enabled"):
         modes.append("live")
     return modes
+
+
+def dedupe_messages(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def empty_trading_account(initial_capital_usd: float, source: str) -> dict[str, Any]:
@@ -78,6 +107,7 @@ def empty_trading_account(initial_capital_usd: float, source: str) -> dict[str, 
         "openPositions": [],
         "openOrders": [],
         "exchangeClosedTrades": [],
+        "executionEvents": [],
         "closedTrades": [],
         "decisions": [],
     }
@@ -119,6 +149,7 @@ def normalize_position(position: dict[str, Any]) -> dict[str, Any]:
         "initialNotionalUsd": num(position.get("initialNotionalUsd")) or notional,
         "stopLoss": num(position.get("stopLoss")),
         "takeProfit": num(position.get("takeProfit")),
+        "takeProfitFraction": num(position.get("takeProfitFraction")),
         "lastMarkPrice": num(position.get("lastMarkPrice")) or entry_price,
         "lastMarkTime": position.get("lastMarkTime") or now_iso(),
         "leverage": num(position.get("leverage")) or 1,
@@ -160,6 +191,10 @@ def normalize_exchange_closed_trade(trade: dict[str, Any]) -> dict[str, Any]:
         "id": str(trade.get("id") or f"exchange-close-{int(__import__('time').time() * 1000)}"),
         "symbol": symbol,
         "baseAsset": str(trade.get("baseAsset") or base_asset_for_symbol(symbol, exchange_id)),
+        "side": "short" if str(trade.get("side") or "long").lower() == "short" else "long",
+        "quantity": num(trade.get("quantity")),
+        "exitPrice": num(trade.get("exitPrice")),
+        "notionalUsd": num(trade.get("notionalUsd")),
         "realizedPnl": num(trade.get("realizedPnl")) or 0,
         "asset": str(trade.get("asset") or "USDT").strip().upper() or "USDT",
         "closedAt": trade.get("closedAt") or now_iso(),
@@ -188,6 +223,170 @@ def normalize_order(order: dict[str, Any]) -> dict[str, Any]:
         "source": str(order.get("source") or exchange_id),
         "updatedAt": order.get("updatedAt") or now_iso(),
     }
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
+
+
+def normalize_execution_event(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(event.get("id") or f"exec-{int(__import__('time').time() * 1000)}"),
+        "at": event.get("at") or now_iso(),
+        "decisionId": event.get("decisionId"),
+        "mode": clean_mode(event.get("mode") or "live"),
+        "exchange": str(event.get("exchange") or "").strip().lower(),
+        "stage": str(event.get("stage") or "").strip(),
+        "actionType": str(event.get("actionType") or "").strip(),
+        "symbol": str(event.get("symbol") or "").upper(),
+        "side": str(event.get("side") or "").strip().lower(),
+        "success": event.get("success") is not False,
+        "requested": _json_safe(event.get("requested") if isinstance(event.get("requested"), dict) else {}),
+        "exchangeResult": _json_safe(event.get("exchangeResult")),
+        "error": str(event.get("error")).strip() if event.get("error") is not None else None,
+    }
+
+
+def append_execution_event(
+    events: list[dict[str, Any]] | None,
+    *,
+    decision_id: str,
+    stage: str,
+    action_type: str,
+    symbol: str | None = None,
+    side: str | None = None,
+    exchange: str | None = None,
+    requested: dict[str, Any] | None = None,
+    exchange_result: Any = None,
+    success: bool = True,
+    error: Any = None,
+) -> dict[str, Any] | None:
+    if events is None:
+        return None
+    event = normalize_execution_event(
+        {
+            "id": f"{decision_id}-exec-{len(events) + 1:03d}",
+            "decisionId": decision_id,
+            "mode": "live",
+            "exchange": exchange,
+            "stage": stage,
+            "actionType": action_type,
+            "symbol": symbol,
+            "side": side,
+            "success": success,
+            "requested": requested or {},
+            "exchangeResult": exchange_result,
+            "error": error,
+        }
+    )
+    events.append(event)
+    return event
+
+
+def _order_matches_position_side(order: dict[str, Any], position: dict[str, Any]) -> bool:
+    side = str(position.get("side") or "").strip().lower()
+    order_side = str(order.get("side") or "").strip().upper()
+    position_side = str(order.get("positionSide") or "").strip().upper()
+    if side == "long":
+        return order_side == "SELL" and position_side in {"", "BOTH", "LONG"}
+    if side == "short":
+        return order_side == "BUY" and position_side in {"", "BOTH", "SHORT"}
+    return False
+
+
+def _infer_exchange_protection_from_orders(position: dict[str, Any], orders: list[dict[str, Any]]) -> dict[str, Any]:
+    symbol = str(position.get("symbol") or "").upper()
+    side = str(position.get("side") or "").strip().lower()
+    quantity = num(position.get("quantity")) or 0
+    reference_price = num(position.get("lastMarkPrice")) or num(position.get("markPrice")) or num(position.get("entryPrice"))
+    if not symbol or side not in {"long", "short"} or reference_price is None:
+        return {}
+    stop_candidates: list[float] = []
+    take_profit_candidates: list[tuple[float, float | None]] = []
+    for raw_order in orders:
+        order = normalize_order(raw_order)
+        if order.get("symbol") != symbol or not _order_matches_position_side(order, position):
+            continue
+        if not _is_protection_order(order):
+            continue
+        trigger_price = num(order.get("triggerPrice"))
+        if trigger_price is None:
+            continue
+        if side == "long":
+            if trigger_price <= reference_price:
+                stop_candidates.append(trigger_price)
+            else:
+                take_profit_candidates.append((trigger_price, num(order.get("quantity"))))
+        else:
+            if trigger_price >= reference_price:
+                stop_candidates.append(trigger_price)
+            else:
+                take_profit_candidates.append((trigger_price, num(order.get("quantity"))))
+    result: dict[str, Any] = {}
+    if stop_candidates:
+        result["stopLoss"] = max(stop_candidates) if side == "long" else min(stop_candidates)
+    if take_profit_candidates:
+        price, order_quantity = (
+            min(take_profit_candidates, key=lambda item: item[0])
+            if side == "long"
+            else max(take_profit_candidates, key=lambda item: item[0])
+        )
+        result["takeProfit"] = price
+        if order_quantity is not None and quantity > 0:
+            result["takeProfitFraction"] = max(0.05, min(1.0, order_quantity / quantity))
+    return result
+
+
+def _is_protection_order(order: dict[str, Any]) -> bool:
+    source = str(order.get("source") or "").strip().lower()
+    order_type = str(order.get("type") or "").strip().upper()
+    if order.get("closePosition") is True or order.get("reduceOnly") is True:
+        return True
+    if source == "binance_algo_order":
+        return True
+    if "TAKE_PROFIT" in order_type or "STOP" in order_type:
+        return True
+    return order_type in {"CONDITIONAL", "STOP_MARKET", "TAKE_PROFIT_MARKET"}
+
+
+def _cleanup_orphan_live_protection_orders(
+    snapshot: dict[str, Any],
+    settings: dict[str, Any],
+    live_config: dict[str, Any] | None,
+    status: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    if not live_config or not status.get("canExecute"):
+        return snapshot, []
+    if not settings.get("liveExecution", {}).get("useExchangeProtectionOrders", True):
+        return snapshot, []
+
+    open_positions = [normalize_position(item) for item in snapshot.get("openPositions", [])]
+    open_orders = [normalize_order(item) for item in snapshot.get("openOrders", [])]
+    position_symbols = {item["symbol"] for item in open_positions}
+    orders_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for order in open_orders:
+        symbol = order.get("symbol")
+        if not symbol:
+            continue
+        orders_by_symbol.setdefault(symbol, []).append(order)
+
+    orphan_symbols = [
+        symbol
+        for symbol, orders in orders_by_symbol.items()
+        if symbol not in position_symbols and orders and all(_is_protection_order(order) for order in orders)
+    ]
+    if not orphan_symbols:
+        return snapshot, []
+
+    warnings: list[str] = []
+    for symbol in orphan_symbols:
+        cancel_all_open_orders(live_config, symbol)
+        warnings.append(f"Canceled orphaned exchange protection orders for {symbol}.")
+    refreshed = fetch_account_snapshot(live_config, session_started_at=snapshot.get("sessionStartedAt"))
+    return refreshed, warnings
 
 
 def derive_session_started_at(book: dict[str, Any]) -> str | None:
@@ -237,6 +436,7 @@ def normalize_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "output": decision.get("output") if isinstance(decision.get("output"), dict) else {},
         "rawModelResponse": decision.get("rawModelResponse") if isinstance(decision.get("rawModelResponse"), dict) else {},
         "actions": decision.get("actions") if isinstance(decision.get("actions"), list) else [],
+        "executionEvents": [normalize_execution_event(item) for item in decision.get("executionEvents", []) if isinstance(item, dict)],
         "warnings": decision.get("warnings") if isinstance(decision.get("warnings"), list) else [],
         "candidateUniverse": decision.get("candidateUniverse") if isinstance(decision.get("candidateUniverse"), list) else [],
         "accountBefore": decision.get("accountBefore") if isinstance(decision.get("accountBefore"), dict) else {},
@@ -244,9 +444,9 @@ def normalize_decision(decision: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def read_trading_state(settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    settings = settings or read_trading_settings()
-    saved = read_json(STATE_PATH, {})
+def read_trading_state(settings: dict[str, Any] | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    settings = settings or read_trading_settings(instance_id)
+    saved = read_json(_state_path(instance_id), {})
     state = default_state(settings)
     for key in ("paper", "live"):
         source = "exchange" if key == "live" else "paper"
@@ -271,6 +471,7 @@ def read_trading_state(settings: dict[str, Any] | None = None) -> dict[str, Any]
             "openPositions": [normalize_position(item) for item in seed.get("openPositions", [])],
             "openOrders": [normalize_order(item) for item in seed.get("openOrders", [])],
             "exchangeClosedTrades": [normalize_exchange_closed_trade(item) for item in seed.get("exchangeClosedTrades", [])],
+            "executionEvents": [normalize_execution_event(item) for item in seed.get("executionEvents", []) if isinstance(item, dict)],
             "closedTrades": [normalize_trade(item) for item in seed.get("closedTrades", [])],
             "decisions": [normalize_decision(item) for item in seed.get("decisions", [])],
         }
@@ -284,22 +485,23 @@ def read_trading_state(settings: dict[str, Any] | None = None) -> dict[str, Any]
     return state
 
 
-def write_trading_state(state: dict[str, Any]) -> dict[str, Any]:
+def write_trading_state(state: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
     payload = deepcopy(state)
     for key in ("paper", "live"):
         payload[key]["openPositions"] = [normalize_position(item) for item in payload[key].get("openPositions", [])]
         payload[key]["openOrders"] = [normalize_order(item) for item in payload[key].get("openOrders", [])][-80:]
         payload[key]["exchangeClosedTrades"] = [normalize_exchange_closed_trade(item) for item in payload[key].get("exchangeClosedTrades", [])][-400:]
+        payload[key]["executionEvents"] = [normalize_execution_event(item) for item in payload[key].get("executionEvents", []) if isinstance(item, dict)][-1000:]
         payload[key]["closedTrades"] = [normalize_trade(item) for item in payload[key].get("closedTrades", [])][-400:]
         payload[key]["decisions"] = [normalize_decision(item) for item in payload[key].get("decisions", [])][-40:]
     payload["updatedAt"] = now_iso()
-    write_json(STATE_PATH, payload)
+    write_json(_state_path(instance_id), payload)
     return payload
 
 
-def archive_decision(decision: dict[str, Any]) -> None:
+def archive_decision(decision: dict[str, Any], instance_id: str | None = None) -> None:
     run_date = current_run_date()
-    path = DECISIONS_DIR / run_date / f"{decision['id']}.json"
+    path = _decisions_dir(instance_id) / run_date / f"{decision['id']}.json"
     write_json(path, decision)
 
 
@@ -328,6 +530,14 @@ def enrich_position(position: dict[str, Any]) -> dict[str, Any]:
 def summarize_account(book: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     open_positions = [enrich_position(item) for item in book.get("openPositions", [])]
     open_orders = [normalize_order(item) for item in book.get("openOrders", [])]
+    if (book.get("accountSource") or "") == "exchange" and open_orders:
+        open_positions = [
+            {
+                **position,
+                **_infer_exchange_protection_from_orders(position, open_orders),
+            }
+            for position in open_positions
+        ]
     exchange_closed_trades = [normalize_exchange_closed_trade(item) for item in book.get("exchangeClosedTrades", [])]
     local_estimated_realized_pnl = sum(num(item.get("realizedPnl")) or 0 for item in book.get("closedTrades", []))
     unrealized_pnl = sum(num(item.get("unrealizedPnl")) or 0 for item in open_positions)
@@ -513,6 +723,7 @@ def build_prompt(
     open_positions: list[dict[str, Any]],
     open_orders: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
+    historical_lessons: list[dict[str, Any]] | None = None,
 ) -> str:
     response_contract = {
         "summary": "short plain-language summary",
@@ -524,6 +735,7 @@ def build_prompt(
                 "reduceFraction": 0.25,
                 "stopLoss": 0.0,
                 "takeProfit": 0.0,
+                "takeProfitFraction": 0.25,
             }
         ],
         "entry_actions": [
@@ -535,6 +747,7 @@ def build_prompt(
                 "reason": "short reason",
                 "stopLoss": 0.0,
                 "takeProfit": 0.0,
+                "takeProfitFraction": 0.25,
             }
         ],
         "watchlist": [
@@ -577,23 +790,42 @@ def build_prompt(
         "Summary and watchlist should only mention symbols that already exist in openPositions or candidates.",
         "Respect the hard risk limits from the system context even if the user logic asks for more.",
         "If there is no clear edge, return empty entry_actions.",
+        "Use takeProfitFraction below 1.0 when a take-profit should only close part of the position and leave a runner.",
         "Return strict JSON only. No markdown, no prose outside the JSON object.",
     ]
-    return "\n".join(
+    if historical_lessons:
+        rules.append(
+            "Historical scene lessons are advisory memory only. Use them to adjust judgment, never to override hard risk limits."
+        )
+        rules.append(
+            "Historical source symbols are audit labels, not transferable edge; match on scene, trend, volatility, pullback, volume, funding, and rank."
+        )
+    sections = [
+        "# Editable Trading Logic JSON",
+        json.dumps(prompt_settings["decision_logic"], ensure_ascii=False, indent=2),
+        "",
+        "# System Rules",
+        *[f"- {rule}" for rule in rules],
+        "",
+        "# Required JSON Contract",
+        json.dumps(response_contract, ensure_ascii=False, indent=2),
+        "",
+    ]
+    if historical_lessons:
+        sections.extend(
+            [
+                "# Historical Scene Lessons (Self-Learning Enabled)",
+                json.dumps(historical_lessons, ensure_ascii=False, indent=2),
+                "",
+            ]
+        )
+    sections.extend(
         [
-            "# Editable Trading Logic JSON",
-            json.dumps(prompt_settings["decision_logic"], ensure_ascii=False, indent=2),
-            "",
-            "# System Rules",
-            *[f"- {rule}" for rule in rules],
-            "",
-            "# Required JSON Contract",
-            json.dumps(response_contract, ensure_ascii=False, indent=2),
-            "",
             "# Current Trading Context",
             json.dumps(context, ensure_ascii=False, indent=2),
         ]
     )
+    return "\n".join(sections)
 
 
 def default_model_decision(open_positions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -638,6 +870,9 @@ def normalize_model_decision(
         reduce_fraction = None
         if decision == "reduce":
             reduce_fraction = clamp(item.get("reduceFraction"), 0.05, 0.95)
+        take_profit_fraction = num(item.get("takeProfitFraction"))
+        if take_profit_fraction is not None:
+            take_profit_fraction = max(0.05, min(1.0, take_profit_fraction))
         normalized_positions.append(
             {
                 "symbol": symbol,
@@ -646,6 +881,7 @@ def normalize_model_decision(
                 "reduceFraction": reduce_fraction,
                 "stopLoss": num(item.get("stopLoss")),
                 "takeProfit": num(item.get("takeProfit")),
+                "takeProfitFraction": take_profit_fraction,
             }
         )
         seen_symbols.add(symbol)
@@ -659,6 +895,7 @@ def normalize_model_decision(
                     "reduceFraction": None,
                     "stopLoss": None,
                     "takeProfit": None,
+                    "takeProfitFraction": None,
                 }
             )
     normalized_entries: list[dict[str, Any]] = []
@@ -684,6 +921,7 @@ def normalize_model_decision(
                 "reason": str(item.get("reason") or candidate.get("topStrategy") or ""),
                 "stopLoss": num(item.get("stopLoss")) or num(candidate.get("defaultStopLoss")),
                 "takeProfit": num(item.get("takeProfit")) or num(candidate.get("defaultTakeProfit")),
+                "takeProfitFraction": max(0.05, min(1.0, num(item.get("takeProfitFraction")) or 1.0)),
             }
         )
     normalized_watchlist = []
@@ -719,17 +957,342 @@ def mark_to_market(book: dict[str, Any], live_by_symbol: dict[str, dict[str, Any
 
 
 def _risk_valid_for_side(side: str, mark_price: float, stop_loss: float | None, take_profit: float | None) -> bool:
+    return _stop_valid_for_side(side, mark_price, stop_loss) and _take_profit_valid_for_side(side, mark_price, take_profit)
+
+
+def _reward_r_multiple(side: str, reference_price: float, stop_loss: float | None, take_profit: float | None) -> float | None:
+    if reference_price <= 0 or stop_loss is None or take_profit is None:
+        return None
+    risk = abs(reference_price - stop_loss)
+    reward = abs(take_profit - reference_price)
+    if risk <= 0:
+        return None
+    return reward / risk
+
+
+def _execution_price_from_order_result(result: Any, fallback_price: float) -> float:
+    if not isinstance(result, dict):
+        return fallback_price
+    for key in ("avgPrice", "averagePrice", "price", "fillPx", "px"):
+        value = num(result.get(key))
+        if value is not None and value > 0:
+            return value
+    fills = result.get("fills")
+    if isinstance(fills, list):
+        total_qty = 0.0
+        total_quote = 0.0
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            price = num(fill.get("price") or fill.get("px"))
+            qty = num(fill.get("qty") or fill.get("quantity") or fill.get("sz"))
+            if price is None or qty is None or price <= 0 or qty <= 0:
+                continue
+            total_qty += qty
+            total_quote += price * qty
+        if total_qty > 0:
+            return total_quote / total_qty
+    return fallback_price
+
+
+def _validate_live_protection_inputs(
+    *,
+    symbol: str,
+    side: str,
+    reference_price: float,
+    stop_loss: float | None,
+    take_profit: float | None,
+    take_profit_fraction: float | None,
+    min_reward_r: float = 1.0,
+) -> tuple[float | None, float | None, float | None, bool, list[str]]:
+    warnings: list[str] = []
+    if reference_price <= 0:
+        return stop_loss, take_profit, take_profit_fraction, True, warnings
+    if not _stop_valid_for_side(side, reference_price, stop_loss):
+        warnings.append(
+            f"Live protection rejected for {symbol}: stopLoss {stop_loss} is invalid after actual reference price {reference_price}."
+        )
+        return None, None, None, False, warnings
+    safe_take_profit = take_profit
+    safe_take_profit_fraction = take_profit_fraction
+    if not _take_profit_valid_for_side(side, reference_price, safe_take_profit):
+        warnings.append(
+            f"Live take-profit skipped for {symbol}: takeProfit {safe_take_profit} would immediately trigger after actual reference price {reference_price}."
+        )
+        safe_take_profit = None
+        safe_take_profit_fraction = None
+    reward_r = _reward_r_multiple(side, reference_price, stop_loss, safe_take_profit)
+    if reward_r is not None and reward_r < min_reward_r:
+        warnings.append(
+            f"Live take-profit skipped for {symbol}: first target is only {reward_r:.2f}R after actual reference price {reference_price}."
+        )
+        safe_take_profit = None
+        safe_take_profit_fraction = None
+    return stop_loss, safe_take_profit, safe_take_profit_fraction, True, warnings
+
+
+def _place_live_protection_orders_with_fallback(
+    live_config: dict[str, Any],
+    *,
+    symbol: str,
+    position_side: str,
+    quantity: float | None,
+    stop_loss: float | None,
+    take_profit: float | None,
+    take_profit_fraction: float | None,
+    warning_prefix: str,
+    decision_id: str | None = None,
+    action_type: str = "protection_update",
+    execution_events: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    exchange_id = str(live_config.get("exchange") or "").strip().lower()
+    requested = {
+        "quantity": quantity,
+        "stopLoss": stop_loss,
+        "takeProfit": take_profit,
+        "takeProfitFraction": take_profit_fraction,
+        "positionSide": position_side,
+    }
+    try:
+        result = place_protection_orders(
+            live_config,
+            symbol=symbol,
+            position_side=position_side,
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            take_profit_fraction=take_profit_fraction,
+        )
+        if decision_id:
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="protection_orders",
+                action_type=action_type,
+                symbol=symbol,
+                side=position_side,
+                exchange=exchange_id,
+                requested=requested,
+                exchange_result=result,
+            )
+        return warnings
+    except Exception as error:
+        if decision_id:
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="protection_orders",
+                action_type=action_type,
+                symbol=symbol,
+                side=position_side,
+                exchange=exchange_id,
+                requested=requested,
+                success=False,
+                error=error,
+            )
+        warnings.append(f"{warning_prefix} for {symbol}: {error}")
+        if stop_loss is None or take_profit is None:
+            return warnings
+    try:
+        cancel_result = cancel_all_open_orders(live_config, symbol)
+        if decision_id:
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="cancel_open_orders",
+                action_type=f"{action_type}_fallback",
+                symbol=symbol,
+                side=position_side,
+                exchange=exchange_id,
+                requested={"reason": "retry_stop_only_after_take_profit_failed"},
+                exchange_result=cancel_result,
+            )
+        result = place_protection_orders(
+            live_config,
+            symbol=symbol,
+            position_side=position_side,
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profit=None,
+            take_profit_fraction=None,
+        )
+        if decision_id:
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="protection_orders_stop_only",
+                action_type=f"{action_type}_fallback",
+                symbol=symbol,
+                side=position_side,
+                exchange=exchange_id,
+                requested={**requested, "takeProfit": None, "takeProfitFraction": None},
+                exchange_result=result,
+            )
+        warnings.append(f"Placed stop-only live protection for {symbol} after take-profit placement failed.")
+    except Exception as stop_error:
+        if decision_id:
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="protection_orders_stop_only",
+                action_type=f"{action_type}_fallback",
+                symbol=symbol,
+                side=position_side,
+                exchange=exchange_id,
+                requested={**requested, "takeProfit": None, "takeProfitFraction": None},
+                success=False,
+                error=stop_error,
+            )
+        warnings.append(f"Stop-only live protection also failed for {symbol}: {stop_error}")
+    return warnings
+
+
+def _stop_valid_for_side(side: str, mark_price: float, stop_loss: float | None) -> bool:
     if side == "long":
         if stop_loss is not None and stop_loss >= mark_price:
-            return False
-        if take_profit is not None and take_profit <= mark_price:
             return False
     else:
         if stop_loss is not None and stop_loss <= mark_price:
             return False
+    return True
+
+
+def _take_profit_valid_for_side(side: str, mark_price: float, take_profit: float | None) -> bool:
+    if side == "long":
+        if take_profit is not None and take_profit <= mark_price:
+            return False
+    else:
         if take_profit is not None and take_profit >= mark_price:
             return False
     return True
+
+
+def _take_profit_reached_for_side(side: str, mark_price: float, take_profit: float | None) -> bool:
+    if take_profit is None:
+        return False
+    if side == "long":
+        return take_profit <= mark_price
+    return take_profit >= mark_price
+
+
+def _trailing_profit_stop(position: dict[str, Any]) -> float | None:
+    entry = num(position.get("entryPrice"))
+    mark = num(position.get("lastMarkPrice"))
+    if entry is None or mark is None or entry <= 0 or mark <= 0:
+        return None
+    side = str(position.get("side") or "").lower()
+    if side == "long":
+        profit_pct = ((mark - entry) / entry) * 100
+    else:
+        profit_pct = ((entry - mark) / entry) * 100
+    if profit_pct < 8:
+        return None
+    if profit_pct >= 20:
+        lock_fraction = 0.50
+    elif profit_pct >= 12:
+        lock_fraction = 0.35
+    else:
+        lock_fraction = 0.20
+    locked_profit = abs(mark - entry) * lock_fraction
+    if side == "long":
+        return entry + locked_profit
+    if side == "short":
+        return entry - locked_profit
+    return None
+
+
+def apply_trailing_profit_stops(
+    book: dict[str, Any],
+    *,
+    live_mode: bool,
+    decision_id: str,
+    status: dict[str, Any] | None = None,
+    live_config: dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    actions: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    execution_events: list[dict[str, Any]] = []
+    use_exchange_orders = bool(settings and settings.get("liveExecution", {}).get("useExchangeProtectionOrders", True))
+    for position in list(book.get("openPositions", [])):
+        mark_price = num(position.get("lastMarkPrice")) or num(position.get("entryPrice"))
+        proposed_stop = _trailing_profit_stop(position)
+        if proposed_stop is None or mark_price is None:
+            continue
+        current_stop = num(position.get("stopLoss"))
+        side = str(position.get("side") or "").lower()
+        if side == "long" and current_stop is not None and current_stop >= proposed_stop:
+            continue
+        if side == "short" and current_stop is not None and current_stop <= proposed_stop:
+            continue
+        if not _stop_valid_for_side(side, mark_price, proposed_stop):
+            continue
+        for current in book.get("openPositions", []):
+            if current["id"] != position["id"]:
+                continue
+            current["stopLoss"] = proposed_stop
+            current["updatedAt"] = now_iso()
+            position = current
+            break
+        if live_mode and status and status.get("canExecute") and live_config and use_exchange_orders:
+            exchange_id = str(live_config.get("exchange") or "").strip().lower()
+            try:
+                cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="cancel_open_orders",
+                    action_type="auto_trailing_stop",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={"reason": "replace_protection_for_trailing_stop"},
+                    exchange_result=cancel_result,
+                )
+            except Exception as error:
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="cancel_open_orders",
+                    action_type="auto_trailing_stop",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={"reason": "replace_protection_for_trailing_stop"},
+                    success=False,
+                    error=error,
+                )
+                warnings.append(f"Trailing stop update failed for {position['symbol']}: {error}")
+            else:
+                warnings.extend(
+                    _place_live_protection_orders_with_fallback(
+                        live_config,
+                        symbol=position["symbol"],
+                        position_side=position["side"],
+                        quantity=num(position.get("quantity")) if position.get("takeProfit") is not None else None,
+                        stop_loss=proposed_stop,
+                        take_profit=num(position.get("takeProfit")),
+                        take_profit_fraction=num(position.get("takeProfitFraction")),
+                        warning_prefix="Trailing stop update failed",
+                        decision_id=decision_id,
+                        action_type="auto_trailing_stop",
+                        execution_events=execution_events,
+                    )
+                )
+        actions.append(
+            {
+                "type": "update",
+                "symbol": position["symbol"],
+                "side": position["side"],
+                "stopLoss": proposed_stop,
+                "takeProfit": position.get("takeProfit"),
+                "takeProfitFraction": position.get("takeProfitFraction"),
+                "reason": "auto_trailing_profit_stop",
+                "label": action_label("update", position["symbol"]),
+            }
+        )
+    return actions, warnings, execution_events
 
 
 def apply_protection_hits(book: dict[str, Any], decision_id: str) -> list[dict[str, Any]]:
@@ -740,13 +1303,24 @@ def apply_protection_hits(book: dict[str, Any], decision_id: str) -> list[dict[s
             continue
         stop_loss = num(position.get("stopLoss"))
         take_profit = num(position.get("takeProfit"))
+        take_profit_fraction = num(position.get("takeProfitFraction"))
         if position["side"] == "long":
             if stop_loss is not None and mark_price <= stop_loss:
                 book, action = close_position(book, position, mark_price, decision_id, "stop_loss_hit")
                 actions.append(action)
                 continue
             if take_profit is not None and mark_price >= take_profit:
-                book, action = close_position(book, position, mark_price, decision_id, "take_profit_hit")
+                if take_profit_fraction is not None and take_profit_fraction < 0.999:
+                    book, action = reduce_position(book, position, mark_price, take_profit_fraction, decision_id, "take_profit_hit")
+                    for current in book.get("openPositions", []):
+                        if current["id"] != position["id"]:
+                            continue
+                        current["takeProfit"] = None
+                        current["takeProfitFraction"] = None
+                        current["updatedAt"] = now_iso()
+                        break
+                else:
+                    book, action = close_position(book, position, mark_price, decision_id, "take_profit_hit")
                 actions.append(action)
                 continue
         else:
@@ -755,7 +1329,17 @@ def apply_protection_hits(book: dict[str, Any], decision_id: str) -> list[dict[s
                 actions.append(action)
                 continue
             if take_profit is not None and mark_price <= take_profit:
-                book, action = close_position(book, position, mark_price, decision_id, "take_profit_hit")
+                if take_profit_fraction is not None and take_profit_fraction < 0.999:
+                    book, action = reduce_position(book, position, mark_price, take_profit_fraction, decision_id, "take_profit_hit")
+                    for current in book.get("openPositions", []):
+                        if current["id"] != position["id"]:
+                            continue
+                        current["takeProfit"] = None
+                        current["takeProfitFraction"] = None
+                        current["updatedAt"] = now_iso()
+                        break
+                else:
+                    book, action = close_position(book, position, mark_price, decision_id, "take_profit_hit")
                 actions.append(action)
                 continue
     return actions
@@ -801,6 +1385,7 @@ def open_paper_position(
     side: str,
     stop_loss: float,
     take_profit: float | None,
+    take_profit_fraction: float | None,
     confidence: float,
     notional_usd: float,
     reason: str,
@@ -821,6 +1406,7 @@ def open_paper_position(
             "initialNotionalUsd": notional_usd,
             "stopLoss": stop_loss,
             "takeProfit": take_profit,
+            "takeProfitFraction": take_profit_fraction,
             "lastMarkPrice": entry_price,
             "lastMarkTime": now_iso(),
             "leverage": 1,
@@ -839,8 +1425,9 @@ def open_paper_position(
 def sync_live_book(
     book: dict[str, Any],
     settings: dict[str, Any],
+    instance_id: str | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any], dict[str, Any] | None]:
-    live_config = read_live_trading_config()
+    live_config = read_live_trading_config(instance_id)
     status = live_execution_status(live_config, settings)
     warnings: list[str] = []
     if not status["canSync"]:
@@ -850,25 +1437,31 @@ def sync_live_book(
     if session_started_at:
         book["sessionStartedAt"] = session_started_at
     snapshot = fetch_account_snapshot(live_config, session_started_at=session_started_at)
+    snapshot["sessionStartedAt"] = session_started_at
     accounting_note = str(snapshot.get("accountingNote") or "").strip()
     if accounting_note:
         warnings.append(accounting_note)
+    snapshot, cleanup_warnings = _cleanup_orphan_live_protection_orders(snapshot, settings, live_config, status)
+    warnings.extend(cleanup_warnings)
     prior_positions = {item["symbol"]: item for item in book.get("openPositions", [])}
+    merged_orders = [normalize_order(item) for item in snapshot.get("openOrders", [])]
+    use_exchange_protection = settings.get("liveExecution", {}).get("useExchangeProtectionOrders", True)
     merged_positions = []
     for position in snapshot["openPositions"]:
         prior = prior_positions.get(position["symbol"], {})
+        protection = _infer_exchange_protection_from_orders(position, merged_orders) if use_exchange_protection else {}
         merged = normalize_position(
             {
                 **position,
-                "stopLoss": prior.get("stopLoss"),
-                "takeProfit": prior.get("takeProfit"),
+                "stopLoss": protection.get("stopLoss") if use_exchange_protection else prior.get("stopLoss"),
+                "takeProfit": protection.get("takeProfit") if use_exchange_protection else prior.get("takeProfit"),
+                "takeProfitFraction": protection.get("takeProfitFraction") if use_exchange_protection else prior.get("takeProfitFraction"),
                 "openedAt": prior.get("openedAt") or now_iso(),
                 "entryReason": prior.get("entryReason") or "synced_from_exchange",
                 "decisionId": prior.get("decisionId"),
             }
         )
         merged_positions.append(merged)
-    merged_orders = [normalize_order(item) for item in snapshot.get("openOrders", [])]
     exchange_closed_trades = [normalize_exchange_closed_trade(item) for item in snapshot.get("exchangeClosedTrades", [])]
     should_seed_equity_baseline = not book.get("decisions") and not book.get("closedTrades")
     snapshot_equity = num(snapshot.get("equityUsd"))
@@ -901,9 +1494,9 @@ def sync_live_book(
     return book, warnings, status, live_config
 
 
-def refresh_account_state_after_settings_save(*, reset_live_session: bool = False) -> dict[str, Any]:
-    settings = read_trading_settings()
-    state = read_trading_state(settings)
+def refresh_account_state_after_settings_save(*, reset_live_session: bool = False, instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
+    state = read_trading_state(settings, instance_id)
 
     paper_has_history = bool(state["paper"].get("decisions") or state["paper"].get("closedTrades"))
     if not paper_has_history:
@@ -924,18 +1517,49 @@ def refresh_account_state_after_settings_save(*, reset_live_session: bool = Fals
 
     live_sync_warnings: list[str] = []
     live_status_payload: dict[str, Any] | None = None
-    live_config: dict[str, Any] | None = None
-    try:
-        state["live"], live_sync_warnings, live_status_payload, live_config = sync_live_book(state["live"], settings)
-    except Exception as error:
-        live_sync_warnings = [f"Live account sync after settings save failed: {error}"]
+    live_config: dict[str, Any] | None = read_live_trading_config(instance_id)
+    live_sync_attempted = False
+    instance_type = None
+    if instance_id:
+        try:
+            instance_type = read_instance(instance_id)["type"]
+        except Exception:
+            instance_type = None
 
-    write_trading_state(state)
+    live_has_local_state = bool(
+        state["live"].get("sessionStartedAt")
+        or state["live"].get("openPositions")
+        or state["live"].get("decisions")
+        or state["live"].get("closedTrades")
+    )
+    if instance_type == "paper":
+        should_sync_live = False
+    else:
+        live_status_payload = live_execution_status(live_config, settings)
+        can_sync_live = bool(live_status_payload.get("canSync"))
+        if instance_type == "live":
+            should_sync_live = can_sync_live
+        else:
+            should_sync_live = can_sync_live and bool(
+                reset_live_session
+                or settings.get("liveTrading", {}).get("enabled")
+                or live_has_local_state
+            )
+
+    if should_sync_live:
+        live_sync_attempted = True
+        try:
+            state["live"], live_sync_warnings, live_status_payload, live_config = sync_live_book(state["live"], settings, instance_id)
+        except Exception as error:
+            live_sync_warnings = [f"Live account sync after settings save failed: {error}"]
+
+    write_trading_state(state, instance_id)
     return {
         "state": state,
         "liveSyncWarnings": live_sync_warnings,
         "liveStatus": live_status_payload,
         "liveConfig": live_config,
+        "liveSyncAttempted": live_sync_attempted,
     }
 
 
@@ -947,59 +1571,469 @@ def apply_live_position_action(
     status: dict[str, Any],
     live_config: dict[str, Any],
     settings: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     actions: list[dict[str, Any]] = []
     warnings: list[str] = []
+    execution_events: list[dict[str, Any]] = []
+    exchange_id = str(live_config.get("exchange") or "").strip().lower()
     decision = action["decision"]
     mark_price = num(position.get("lastMarkPrice")) or num(position.get("entryPrice")) or 0
     if decision in {"close", "reduce"} and not status["canExecute"]:
         warnings.append(f"Live execution skipped for {position['symbol']}: real execution is not enabled.")
-        return book, actions, warnings
+        return book, actions, warnings, execution_events
     if decision == "close":
-        cancel_all_open_orders(live_config, position["symbol"])
+        cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+        append_execution_event(
+            execution_events,
+            decision_id=decision_id,
+            stage="cancel_open_orders",
+            action_type="close",
+            symbol=position["symbol"],
+            side=position["side"],
+            exchange=exchange_id,
+            requested={"reason": "close_before_market_order"},
+            exchange_result=cancel_result,
+        )
         order_side = "SELL" if position["side"] == "long" else "BUY"
-        place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=position["quantity"], reduce_only=True)
+        order_result = place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=position["quantity"], reduce_only=True)
+        append_execution_event(
+            execution_events,
+            decision_id=decision_id,
+            stage="market_order",
+            action_type="close",
+            symbol=position["symbol"],
+            side=position["side"],
+            exchange=exchange_id,
+            requested={"orderSide": order_side, "quantity": position["quantity"], "reduceOnly": True},
+            exchange_result=order_result,
+        )
         book, recorded = close_position(book, position, mark_price, decision_id, action["reason"] or "model_close")
         recorded["exchange"] = True
         actions.append(recorded)
-        return book, actions, warnings
+        return book, actions, warnings, execution_events
     if decision == "reduce":
-        close_qty = (num(position.get("quantity")) or 0) * action["reduceFraction"]
-        normalized_qty = normalize_quantity(live_config, position["symbol"], quantity=close_qty, reference_price=mark_price)
+        position_qty = num(position.get("quantity")) or 0
+        close_qty = position_qty * action["reduceFraction"]
         order_side = "SELL" if position["side"] == "long" else "BUY"
-        place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=normalized_qty, reduce_only=True)
-        book, recorded = reduce_position(book, position, mark_price, action["reduceFraction"], decision_id, action["reason"] or "model_reduce")
+        existing_stop_loss = num(position.get("stopLoss"))
+        existing_take_profit = num(position.get("takeProfit"))
+        existing_take_profit_fraction = num(position.get("takeProfitFraction"))
+        try:
+            normalized_qty = normalize_quantity(live_config, position["symbol"], quantity=close_qty, reference_price=mark_price)
+        except Exception as error:
+            warnings.append(f"Live reduce skipped for {position['symbol']}: {error}")
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="normalize_quantity",
+                action_type="reduce",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"requestedQuantity": close_qty, "reduceFraction": action["reduceFraction"], "referencePrice": mark_price},
+                success=False,
+                error=error,
+            )
+            return book, actions, warnings, execution_events
+        try:
+            cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="cancel_open_orders",
+                action_type="reduce",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"reason": "reduce_before_market_order"},
+                exchange_result=cancel_result,
+            )
+            order_result = place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=normalized_qty, reduce_only=True)
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="market_order",
+                action_type="reduce",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={
+                    "orderSide": order_side,
+                    "quantity": normalized_qty,
+                    "reduceOnly": True,
+                    "requestedQuantity": close_qty,
+                    "requestedReduceFraction": action["reduceFraction"],
+                },
+                exchange_result=order_result,
+            )
+        except Exception as error:
+            warnings.append(f"Live reduce failed for {position['symbol']}: {error}")
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="market_order",
+                action_type="reduce",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"orderSide": order_side, "quantity": normalized_qty, "reduceOnly": True},
+                success=False,
+                error=error,
+            )
+            if settings["liveExecution"]["useExchangeProtectionOrders"] and (existing_stop_loss is not None or existing_take_profit is not None):
+                try:
+                    restore_result = place_protection_orders(
+                        live_config,
+                        symbol=position["symbol"],
+                        position_side=position["side"],
+                        quantity=num(position.get("quantity")),
+                        stop_loss=existing_stop_loss,
+                        take_profit=existing_take_profit,
+                        take_profit_fraction=existing_take_profit_fraction,
+                    )
+                    append_execution_event(
+                        execution_events,
+                        decision_id=decision_id,
+                        stage="protection_orders_restore",
+                        action_type="reduce_restore_after_failure",
+                        symbol=position["symbol"],
+                        side=position["side"],
+                        exchange=exchange_id,
+                        requested={
+                            "quantity": num(position.get("quantity")),
+                            "stopLoss": existing_stop_loss,
+                            "takeProfit": existing_take_profit,
+                            "takeProfitFraction": existing_take_profit_fraction,
+                        },
+                        exchange_result=restore_result,
+                    )
+                except Exception as restore_error:
+                    warnings.append(f"Exchange protection restore failed for {position['symbol']}: {restore_error}")
+                    append_execution_event(
+                        execution_events,
+                        decision_id=decision_id,
+                        stage="protection_orders_restore",
+                        action_type="reduce_restore_after_failure",
+                        symbol=position["symbol"],
+                        side=position["side"],
+                        exchange=exchange_id,
+                        requested={
+                            "quantity": num(position.get("quantity")),
+                            "stopLoss": existing_stop_loss,
+                            "takeProfit": existing_take_profit,
+                            "takeProfitFraction": existing_take_profit_fraction,
+                        },
+                        success=False,
+                        error=restore_error,
+                    )
+            return book, actions, warnings, execution_events
+        actual_reduce_fraction = normalized_qty / position_qty if position_qty > 0 else action["reduceFraction"]
+        book, recorded = reduce_position(book, position, mark_price, actual_reduce_fraction, decision_id, action["reason"] or "model_reduce")
         if recorded:
             recorded["exchange"] = True
             actions.append(recorded)
-        return book, actions, warnings
+        remaining_position = next((item for item in book.get("openPositions", []) if item["id"] == position["id"]), None)
+        if remaining_position:
+            next_stop_loss = num(action.get("stopLoss")) if action.get("stopLoss") is not None else existing_stop_loss
+            next_take_profit = num(action.get("takeProfit"))
+            next_take_profit_fraction = num(action.get("takeProfitFraction"))
+            protection_valid = True
+            if settings["liveExecution"]["useExchangeProtectionOrders"] and (next_stop_loss is not None or next_take_profit is not None):
+                reference_price = num(remaining_position.get("lastMarkPrice")) or mark_price
+                (
+                    next_stop_loss,
+                    next_take_profit,
+                    next_take_profit_fraction,
+                    protection_valid,
+                    protection_warnings,
+                ) = _validate_live_protection_inputs(
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    reference_price=reference_price,
+                    stop_loss=next_stop_loss,
+                    take_profit=next_take_profit,
+                    take_profit_fraction=next_take_profit_fraction,
+                )
+                warnings.extend(protection_warnings)
+            for current in book.get("openPositions", []):
+                if current["id"] != position["id"]:
+                    continue
+                current["stopLoss"] = next_stop_loss if protection_valid else existing_stop_loss
+                current["takeProfit"] = next_take_profit if protection_valid else existing_take_profit
+                current["takeProfitFraction"] = next_take_profit_fraction if protection_valid else existing_take_profit_fraction
+                current["updatedAt"] = now_iso()
+                remaining_position = current
+                break
+            if (
+                protection_valid
+                and settings["liveExecution"]["useExchangeProtectionOrders"]
+                and (next_stop_loss is not None or next_take_profit is not None)
+            ):
+                warnings.extend(
+                    _place_live_protection_orders_with_fallback(
+                        live_config,
+                        symbol=position["symbol"],
+                        position_side=position["side"],
+                        quantity=num(remaining_position.get("quantity")),
+                        stop_loss=next_stop_loss,
+                        take_profit=next_take_profit,
+                        take_profit_fraction=next_take_profit_fraction,
+                        warning_prefix="Exchange protection order update failed",
+                        decision_id=decision_id,
+                        action_type="reduce_protection_update",
+                        execution_events=execution_events,
+                    )
+                )
+        return book, actions, warnings, execution_events
     if decision in {"hold", "update"}:
         stop_loss = action.get("stopLoss")
         take_profit = action.get("takeProfit")
-        if stop_loss is None and take_profit is None:
-            return book, actions, warnings
-        if not _risk_valid_for_side(position["side"], mark_price, stop_loss, take_profit):
+        take_profit_fraction = num(action.get("takeProfitFraction"))
+        if take_profit_fraction is not None:
+            take_profit_fraction = max(0.05, min(1.0, take_profit_fraction))
+        if stop_loss is None and take_profit is None and take_profit_fraction is None:
+            return book, actions, warnings, execution_events
+        if (
+            take_profit is not None
+            and take_profit_fraction is not None
+            and take_profit_fraction < 1.0
+            and _take_profit_reached_for_side(position["side"], mark_price, take_profit)
+        ):
+            if not status["canExecute"]:
+                warnings.append(f"Live partial take-profit skipped for {position['symbol']}: real execution is not enabled.")
+                return book, actions, warnings, execution_events
+            existing_stop_loss = num(position.get("stopLoss"))
+            existing_take_profit = num(position.get("takeProfit"))
+            existing_take_profit_fraction = num(position.get("takeProfitFraction"))
+            next_stop_loss = stop_loss if _stop_valid_for_side(position["side"], mark_price, stop_loss) else existing_stop_loss
+            position_qty = num(position.get("quantity")) or 0
+            close_qty = position_qty * take_profit_fraction
+            try:
+                normalized_qty = normalize_quantity(live_config, position["symbol"], quantity=close_qty, reference_price=mark_price)
+            except Exception as error:
+                warnings.append(f"Live partial take-profit skipped for {position['symbol']}: {error}")
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="normalize_quantity",
+                    action_type="partial_take_profit",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={"requestedQuantity": close_qty, "takeProfitFraction": take_profit_fraction, "referencePrice": mark_price},
+                    success=False,
+                    error=error,
+                )
+                return book, actions, warnings, execution_events
+            try:
+                order_side = "SELL" if position["side"] == "long" else "BUY"
+                cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="cancel_open_orders",
+                    action_type="partial_take_profit",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={"reason": "partial_take_profit_before_market_order"},
+                    exchange_result=cancel_result,
+                )
+                order_result = place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=normalized_qty, reduce_only=True)
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="market_order",
+                    action_type="partial_take_profit",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={
+                        "orderSide": order_side,
+                        "quantity": normalized_qty,
+                        "reduceOnly": True,
+                        "requestedQuantity": close_qty,
+                        "takeProfit": take_profit,
+                        "takeProfitFraction": take_profit_fraction,
+                    },
+                    exchange_result=order_result,
+                )
+            except Exception as error:
+                warnings.append(f"Live partial take-profit failed for {position['symbol']}: {error}")
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="market_order",
+                    action_type="partial_take_profit",
+                    symbol=position["symbol"],
+                    side=position["side"],
+                    exchange=exchange_id,
+                    requested={"orderSide": order_side, "quantity": normalized_qty, "reduceOnly": True},
+                    success=False,
+                    error=error,
+                )
+                if settings["liveExecution"]["useExchangeProtectionOrders"] and (existing_stop_loss is not None or existing_take_profit is not None):
+                    try:
+                        restore_result = place_protection_orders(
+                            live_config,
+                            symbol=position["symbol"],
+                            position_side=position["side"],
+                            quantity=num(position.get("quantity")),
+                            stop_loss=existing_stop_loss,
+                            take_profit=existing_take_profit,
+                            take_profit_fraction=existing_take_profit_fraction,
+                        )
+                        append_execution_event(
+                            execution_events,
+                            decision_id=decision_id,
+                            stage="protection_orders_restore",
+                            action_type="partial_take_profit_restore_after_failure",
+                            symbol=position["symbol"],
+                            side=position["side"],
+                            exchange=exchange_id,
+                            requested={
+                                "quantity": num(position.get("quantity")),
+                                "stopLoss": existing_stop_loss,
+                                "takeProfit": existing_take_profit,
+                                "takeProfitFraction": existing_take_profit_fraction,
+                            },
+                            exchange_result=restore_result,
+                        )
+                    except Exception as restore_error:
+                        warnings.append(f"Exchange protection restore failed for {position['symbol']}: {restore_error}")
+                        append_execution_event(
+                            execution_events,
+                            decision_id=decision_id,
+                            stage="protection_orders_restore",
+                            action_type="partial_take_profit_restore_after_failure",
+                            symbol=position["symbol"],
+                            side=position["side"],
+                            exchange=exchange_id,
+                            requested={
+                                "quantity": num(position.get("quantity")),
+                                "stopLoss": existing_stop_loss,
+                                "takeProfit": existing_take_profit,
+                                "takeProfitFraction": existing_take_profit_fraction,
+                            },
+                            success=False,
+                            error=restore_error,
+                        )
+                return book, actions, warnings, execution_events
+            actual_take_profit_fraction = normalized_qty / position_qty if position_qty > 0 else take_profit_fraction
+            book, recorded = reduce_position(book, position, mark_price, actual_take_profit_fraction, decision_id, action["reason"] or "model_partial_take_profit")
+            if recorded:
+                recorded["exchange"] = True
+                actions.append(recorded)
+            remaining_position = next((item for item in book.get("openPositions", []) if item["id"] == position["id"]), None)
+            if remaining_position:
+                for current in book.get("openPositions", []):
+                    if current["id"] != position["id"]:
+                        continue
+                    current["stopLoss"] = next_stop_loss
+                    current["takeProfit"] = None
+                    current["takeProfitFraction"] = None
+                    current["updatedAt"] = now_iso()
+                    remaining_position = current
+                    break
+                if settings["liveExecution"]["useExchangeProtectionOrders"] and next_stop_loss is not None:
+                    (
+                        next_stop_loss,
+                        _,
+                        _,
+                        protection_valid,
+                        protection_warnings,
+                    ) = _validate_live_protection_inputs(
+                        symbol=position["symbol"],
+                        side=position["side"],
+                        reference_price=num(remaining_position.get("lastMarkPrice")) or mark_price,
+                        stop_loss=next_stop_loss,
+                        take_profit=None,
+                        take_profit_fraction=None,
+                    )
+                    warnings.extend(protection_warnings)
+                    if protection_valid:
+                        warnings.extend(
+                            _place_live_protection_orders_with_fallback(
+                                live_config,
+                                symbol=position["symbol"],
+                                position_side=position["side"],
+                                quantity=num(remaining_position.get("quantity")),
+                                stop_loss=next_stop_loss,
+                                take_profit=None,
+                                take_profit_fraction=None,
+                                warning_prefix="Exchange protection order update failed",
+                                decision_id=decision_id,
+                                action_type="partial_take_profit_protection_update",
+                                execution_events=execution_events,
+                            )
+                        )
+            return book, actions, warnings, execution_events
+        (
+            stop_loss,
+            take_profit,
+            take_profit_fraction,
+            protection_valid,
+            protection_warnings,
+        ) = _validate_live_protection_inputs(
+            symbol=position["symbol"],
+            side=position["side"],
+            reference_price=mark_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            take_profit_fraction=take_profit_fraction,
+        )
+        warnings.extend(protection_warnings)
+        if not protection_valid:
             warnings.append(f"Ignored invalid live protection update for {position['symbol']}.")
-            return book, actions, warnings
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="protection_validation",
+                action_type="protection_update",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"stopLoss": stop_loss, "takeProfit": take_profit, "takeProfitFraction": take_profit_fraction},
+                success=False,
+                error="invalid live protection update",
+            )
+            return book, actions, warnings, execution_events
         for current in book.get("openPositions", []):
             if current["id"] != position["id"]:
                 continue
             current["stopLoss"] = stop_loss
             current["takeProfit"] = take_profit
+            current["takeProfitFraction"] = take_profit_fraction
             current["updatedAt"] = now_iso()
             break
         if status["canExecute"] and settings["liveExecution"]["useExchangeProtectionOrders"]:
-            try:
-                cancel_all_open_orders(live_config, position["symbol"])
-                place_protection_orders(
+            cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="cancel_open_orders",
+                action_type="protection_update",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"reason": "replace_protection_for_model_update"},
+                exchange_result=cancel_result,
+            )
+            warnings.extend(
+                _place_live_protection_orders_with_fallback(
                     live_config,
                     symbol=position["symbol"],
                     position_side=position["side"],
+                    quantity=num(position.get("quantity")),
                     stop_loss=stop_loss,
                     take_profit=take_profit,
+                    take_profit_fraction=take_profit_fraction,
+                    warning_prefix="Exchange protection order update failed",
+                    decision_id=decision_id,
+                    action_type="protection_update",
+                    execution_events=execution_events,
                 )
-            except Exception as error:
-                warnings.append(f"Exchange protection order update failed for {position['symbol']}: {error}")
+            )
         actions.append(
             {
                 "type": "update",
@@ -1007,11 +2041,12 @@ def apply_live_position_action(
                 "side": position["side"],
                 "stopLoss": stop_loss,
                 "takeProfit": take_profit,
+                "takeProfitFraction": take_profit_fraction,
                 "reason": action["reason"] or "model_update",
                 "label": action_label("update", position["symbol"]),
             }
         )
-    return book, actions, warnings
+    return book, actions, warnings, execution_events
 
 
 def apply_paper_position_action(
@@ -1035,7 +2070,31 @@ def apply_paper_position_action(
         return book, actions, warnings
     stop_loss = action.get("stopLoss")
     take_profit = action.get("takeProfit")
-    if decision in {"hold", "update"} and (stop_loss is not None or take_profit is not None):
+    take_profit_fraction = num(action.get("takeProfitFraction"))
+    if take_profit_fraction is not None:
+        take_profit_fraction = max(0.05, min(1.0, take_profit_fraction))
+    if decision in {"hold", "update"} and (stop_loss is not None or take_profit is not None or take_profit_fraction is not None):
+        if (
+            take_profit is not None
+            and take_profit_fraction is not None
+            and take_profit_fraction < 1.0
+            and _take_profit_reached_for_side(position["side"], mark_price, take_profit)
+        ):
+            book, recorded = reduce_position(book, position, mark_price, take_profit_fraction, decision_id, action["reason"] or "model_partial_take_profit")
+            if recorded:
+                actions.append(recorded)
+            remaining_position = next((item for item in book.get("openPositions", []) if item["id"] == position["id"]), None)
+            if remaining_position:
+                next_stop_loss = stop_loss if _stop_valid_for_side(position["side"], mark_price, stop_loss) else num(position.get("stopLoss"))
+                for current in book.get("openPositions", []):
+                    if current["id"] != position["id"]:
+                        continue
+                    current["stopLoss"] = next_stop_loss
+                    current["takeProfit"] = None
+                    current["takeProfitFraction"] = None
+                    current["updatedAt"] = now_iso()
+                    break
+            return book, actions, warnings
         if not _risk_valid_for_side(position["side"], mark_price, stop_loss, take_profit):
             warnings.append(f"Ignored invalid risk update for {position['symbol']}.")
             return book, actions, warnings
@@ -1044,6 +2103,7 @@ def apply_paper_position_action(
                 continue
             current["stopLoss"] = stop_loss
             current["takeProfit"] = take_profit
+            current["takeProfitFraction"] = take_profit_fraction
             current["updatedAt"] = now_iso()
             break
         actions.append(
@@ -1053,6 +2113,7 @@ def apply_paper_position_action(
                 "side": position["side"],
                 "stopLoss": stop_loss,
                 "takeProfit": take_profit,
+                "takeProfitFraction": take_profit_fraction,
                 "reason": action["reason"] or "model_update",
                 "label": action_label("update", position["symbol"]),
             }
@@ -1068,24 +2129,48 @@ def apply_account_circuit_breaker(
     live_mode: bool,
     live_status_payload: dict[str, Any] | None = None,
     live_config: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     account = summarize_account(book, settings)
     if account["drawdownPct"] < settings["maxAccountDrawdownPct"]:
         book["circuitBreakerTripped"] = False
         book["circuitBreakerReason"] = None
-        return book, [], []
+        return book, [], [], []
     book["circuitBreakerTripped"] = True
     book["circuitBreakerReason"] = f"Drawdown {account['drawdownPct']:.2f}% breached max {settings['maxAccountDrawdownPct']:.2f}%."
     actions: list[dict[str, Any]] = []
     warnings: list[str] = []
+    execution_events: list[dict[str, Any]] = []
+    exchange_id = str((live_config or {}).get("exchange") or "").strip().lower()
     for position in list(book.get("openPositions", [])):
         if live_mode:
             if not live_status_payload or not live_status_payload.get("canExecute"):
                 warnings.append(f"Circuit breaker could not close live {position['symbol']} because real execution is not enabled.")
                 continue
-            cancel_all_open_orders(live_config, position["symbol"])
+            cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="cancel_open_orders",
+                action_type="circuit_breaker",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"reason": "circuit_breaker"},
+                exchange_result=cancel_result,
+            )
             order_side = "SELL" if position["side"] == "long" else "BUY"
-            place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=position["quantity"], reduce_only=True)
+            order_result = place_market_order(live_config, symbol=position["symbol"], side=order_side, quantity=position["quantity"], reduce_only=True)
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="market_order",
+                action_type="circuit_breaker",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"orderSide": order_side, "quantity": position["quantity"], "reduceOnly": True},
+                exchange_result=order_result,
+            )
         book, recorded = close_position(
             book,
             position,
@@ -1096,7 +2181,7 @@ def apply_account_circuit_breaker(
         recorded["type"] = "circuit_breaker"
         recorded["label"] = action_label("circuit_breaker")
         actions.append(recorded)
-    return book, actions, warnings
+    return book, actions, warnings, execution_events
 
 
 def _fetch_live_contexts(symbols: list[str], prompt_kline_feeds: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -1124,32 +2209,85 @@ def _fetch_live_contexts_for_exchange(
     return live_by_symbol, warnings
 
 
-def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) -> dict[str, Any]:
-    settings = read_trading_settings()
+def run_trading_cycle(reason: str = "manual", mode_override: str | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
     settings["mode"] = clean_mode(mode_override or settings["mode"])
-    universe = read_fixed_universe()
+    universe = read_fixed_universe(instance_id)
     account_key = account_key_for_mode(settings["mode"])
     cycle_exchange_id = str(settings.get("activeExchange") or "binance").strip().lower() or "binance"
     live_config = None
     if account_key == "live":
-        live_config = read_live_trading_config()
+        live_config = read_live_trading_config(instance_id)
         cycle_exchange_id = str(live_config.get("exchange") or cycle_exchange_id).strip().lower() or cycle_exchange_id
-    scan = read_latest_scan(cycle_exchange_id)
+    scan = read_latest_scan(cycle_exchange_id, instance_id)
     if universe.get("dynamicSource", {}).get("enabled") or not scan["opportunities"] or str(scan.get("exchange") or "").strip().lower() != cycle_exchange_id:
-        scan = refresh_candidate_pool(cycle_exchange_id)
-    state = read_trading_state(settings)
+        scan = refresh_candidate_pool(cycle_exchange_id, instance_id)
+    state = read_trading_state(settings, instance_id)
     book = state[account_key]
     if account_key != "live":
         book["initialCapitalUsd"] = settings["initialCapitalUsd"]
     book.setdefault("sessionStartedAt", book.get("sessionStartedAt") or now_iso())
     decision_id = f"trade-cycle-{int(__import__('time').time() * 1000)}"
     warnings: list[str] = []
+    execution_events: list[dict[str, Any]] = []
     live_status_payload = None
     if account_key == "live":
-        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings)
+        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings, instance_id)
         warnings.extend(live_warnings)
         state["live"] = book
-    prompt_settings = read_prompt_settings()
+        active_cooldown = (live_status_payload or {}).get("cooldown") or cooldown_status(cycle_exchange_id)
+        if active_cooldown.get("active"):
+            account_snapshot = summarize_account(book, settings)
+            provider = read_llm_provider(instance_id)
+            summary = f"Skipped live cycle because {str(cycle_exchange_id).upper()} API cooldown is active."
+            book["lastDecisionAt"] = now_iso()
+            warnings = dedupe_messages(warnings + [active_cooldown.get("message") or summary])
+            decision = normalize_decision(
+                {
+                    "id": decision_id,
+                    "startedAt": now_iso(),
+                    "finishedAt": now_iso(),
+                    "runnerReason": reason,
+                    "mode": settings["mode"],
+                    "prompt": "",
+                    "promptSummary": summary,
+                    "output": {
+                        "summary": summary,
+                        "positionActions": [],
+                        "entryActions": [],
+                        "watchlist": [],
+                        "providerStatus": provider_status(provider),
+                        "liveExecutionStatus": live_status_payload,
+                    },
+                    "rawModelResponse": {},
+                    "actions": [],
+                    "executionEvents": [],
+                    "warnings": warnings,
+                    "candidateUniverse": [],
+                    "accountBefore": account_snapshot,
+                    "accountAfter": account_snapshot,
+                }
+            )
+            book.setdefault("decisions", []).append(decision)
+            state["adaptive"] = {
+                "updatedAt": now_iso(),
+                "notes": [
+                    summary,
+                    "Live exchange requests are paused during cooldown to avoid extending the ban window.",
+                    "Paper instances can keep using cached/public data while live signed requests wait.",
+                ],
+            }
+            write_trading_state(state, instance_id)
+            archive_decision(decision, instance_id)
+            return {
+                "settings": settings,
+                "state": state,
+                "decision": decision,
+                "marketBackdrop": {},
+                "liveExecutionStatus": live_status_payload,
+                "instanceId": instance_id,
+            }
+    prompt_settings = read_prompt_settings(instance_id)
     prompt_kline_feeds = prompt_settings.get("klineFeeds") if isinstance(prompt_settings.get("klineFeeds"), dict) else {}
     raw_candidates = candidate_universe_from_scan(scan)
     symbols = []
@@ -1164,6 +2302,16 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
     warnings.extend(live_context_warnings)
     mark_to_market(book, live_by_symbol)
     protection_actions = apply_protection_hits(book, decision_id)
+    trailing_actions, trailing_warnings, trailing_execution_events = apply_trailing_profit_stops(
+        book,
+        live_mode=account_key == "live",
+        decision_id=decision_id,
+        status=live_status_payload,
+        live_config=live_config,
+        settings=settings,
+    )
+    warnings.extend(trailing_warnings)
+    execution_events.extend(trailing_execution_events)
     gateway = get_active_exchange_gateway(cycle_exchange_id)
     market_backdrop = fetch_market_backdrop(prompt_kline_feeds, cycle_exchange_id) if gateway.default_backdrop_symbol in symbols else {}
     candidate_snapshots = []
@@ -1175,7 +2323,12 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
         candidate_snapshots.append(build_candidate_snapshot(opportunity, live, settings, cycle_exchange_id))
     candidates_by_symbol = {item["symbol"]: item for item in candidate_snapshots}
     account_before = summarize_account(book, settings)
-    provider = read_llm_provider()
+    provider = read_llm_provider(instance_id)
+    historical_lessons = historical_lessons_for_prompt(
+        instance_id=instance_id,
+        settings=settings,
+        candidates=candidate_snapshots,
+    )
     prompt = build_prompt(
         settings=settings,
         prompt_settings=prompt_settings,
@@ -1185,33 +2338,44 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
         open_positions=account_before["openPositions"],
         open_orders=[normalize_order(item) for item in book.get("openOrders", [])],
         candidates=candidate_snapshots,
+        historical_lessons=historical_lessons,
     )
     model_result: dict[str, Any] | None = None
     try:
-        model_result = generate_trading_decision(prompt, provider)
+        model_result = generate_trading_decision(prompt, provider, read_network_settings(instance_id))
         parsed_model = normalize_model_decision(
             model_result["parsed"],
             open_positions=account_before["openPositions"],
             candidates_by_symbol=candidates_by_symbol,
         )
+    except ModelDecisionParseError as error:
+        warnings.append(f"Model decision failed: {error}")
+        model_result = {
+            "provider": error.provider_result,
+            "rawText": error.raw_text,
+            "rawResponse": error.raw_response,
+            "parsed": {},
+        }
+        parsed_model = default_model_decision(account_before["openPositions"])
     except Exception as error:
         warnings.append(f"Model decision failed: {error}")
         parsed_model = default_model_decision(account_before["openPositions"])
-    management_actions = list(protection_actions)
+    management_actions = list(protection_actions) + trailing_actions
     for instruction in parsed_model["position_actions"]:
         position = next((item for item in list(book.get("openPositions", [])) if item["symbol"] == instruction["symbol"]), None)
         if not position:
             continue
         if account_key == "live":
-            book, applied_actions, applied_warnings = apply_live_position_action(
+            book, applied_actions, applied_warnings, applied_execution_events = apply_live_position_action(
                 book,
                 position,
                 instruction,
                 decision_id,
                 live_status_payload or {"canExecute": False},
-                live_config or read_live_trading_config(),
+                live_config or read_live_trading_config(instance_id),
                 settings,
             )
+            execution_events.extend(applied_execution_events)
         else:
             book, applied_actions, applied_warnings = apply_paper_position_action(
                 book,
@@ -1221,7 +2385,7 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
             )
         management_actions.extend(applied_actions)
         warnings.extend(applied_warnings)
-    book, breaker_actions, breaker_warnings = apply_account_circuit_breaker(
+    book, breaker_actions, breaker_warnings, breaker_execution_events = apply_account_circuit_breaker(
         book,
         settings,
         decision_id,
@@ -1230,6 +2394,7 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
         live_config=live_config,
     )
     warnings.extend(breaker_warnings)
+    execution_events.extend(breaker_execution_events)
     entry_actions: list[dict[str, Any]] = []
     if not book.get("circuitBreakerTripped"):
         account_after_management = summarize_account(book, settings)
@@ -1251,10 +2416,19 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
             entry_price = num(candidate.get("price")) or 0
             stop_loss = num(entry.get("stopLoss"))
             take_profit = num(entry.get("takeProfit"))
+            take_profit_fraction = num(entry.get("takeProfitFraction"))
+            if take_profit_fraction is not None:
+                take_profit_fraction = max(0.05, min(1.0, take_profit_fraction))
             if entry_price <= 0 or stop_loss is None:
                 continue
             if not _risk_valid_for_side(side, entry_price, stop_loss, take_profit):
                 warnings.append(f"Ignored invalid entry risk for {entry['symbol']}.")
+                continue
+            reward_r = _reward_r_multiple(side, entry_price, stop_loss, take_profit)
+            if reward_r is not None and reward_r < 1.0:
+                warnings.append(
+                    f"Skipped entry {entry['symbol']}: first take-profit is only {reward_r:.2f}R versus stop risk."
+                )
                 continue
             notional_usd = position_notional_from_risk(
                 account_after_management,
@@ -1265,7 +2439,8 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
             if notional_usd < 20:
                 continue
             if account_key == "live":
-                live_config = live_config or read_live_trading_config()
+                live_config = live_config or read_live_trading_config(instance_id)
+                exchange_id = str(live_config.get("exchange") or "").strip().lower()
                 live_status_payload = live_status_payload or live_execution_status(live_config, settings)
                 if not live_status_payload["canExecute"]:
                     warnings.append(f"Skipped live entry {entry['symbol']}: real execution is not enabled.")
@@ -1280,23 +2455,134 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
                     continue
                 try:
                     apply_symbol_settings(live_config, entry["symbol"])
+                    append_execution_event(
+                        execution_events,
+                        decision_id=decision_id,
+                        stage="symbol_settings",
+                        action_type="open",
+                        symbol=entry["symbol"],
+                        side=side,
+                        exchange=exchange_id,
+                        requested={
+                            "leverage": live_config.get("defaultLeverage"),
+                            "marginType": live_config.get("marginType"),
+                        },
+                    )
                 except Exception as error:
                     warnings.append(f"Live symbol settings update skipped for {entry['symbol']}: {error}")
+                    append_execution_event(
+                        execution_events,
+                        decision_id=decision_id,
+                        stage="symbol_settings",
+                        action_type="open",
+                        symbol=entry["symbol"],
+                        side=side,
+                        exchange=exchange_id,
+                        requested={
+                            "leverage": live_config.get("defaultLeverage"),
+                            "marginType": live_config.get("marginType"),
+                        },
+                        success=False,
+                        error=error,
+                    )
                 quantity = normalize_quantity(live_config, entry["symbol"], notional_usd=notional_usd, reference_price=entry_price)
                 order_side = "BUY" if side == "long" else "SELL"
-                place_market_order(live_config, symbol=entry["symbol"], side=order_side, quantity=quantity)
-                if settings["liveExecution"]["useExchangeProtectionOrders"]:
+                order_result = place_market_order(live_config, symbol=entry["symbol"], side=order_side, quantity=quantity)
+                append_execution_event(
+                    execution_events,
+                    decision_id=decision_id,
+                    stage="market_order",
+                    action_type="open",
+                    symbol=entry["symbol"],
+                    side=side,
+                    exchange=exchange_id,
+                    requested={
+                        "orderSide": order_side,
+                        "quantity": quantity,
+                        "reduceOnly": False,
+                        "candidatePrice": entry_price,
+                        "notionalUsd": notional_usd,
+                    },
+                    exchange_result=order_result,
+                )
+                live_entry_price = _execution_price_from_order_result(order_result, entry_price)
+                (
+                    stop_loss,
+                    take_profit,
+                    take_profit_fraction,
+                    protection_valid,
+                    protection_warnings,
+                ) = _validate_live_protection_inputs(
+                    symbol=entry["symbol"],
+                    side=side,
+                    reference_price=live_entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    take_profit_fraction=take_profit_fraction,
+                )
+                warnings.extend(protection_warnings)
+                if not protection_valid:
                     try:
                         cancel_all_open_orders(live_config, entry["symbol"])
-                        place_protection_orders(
+                        close_side = "SELL" if side == "long" else "BUY"
+                        guard_result = place_market_order(live_config, symbol=entry["symbol"], side=close_side, quantity=quantity, reduce_only=True)
+                        append_execution_event(
+                            execution_events,
+                            decision_id=decision_id,
+                            stage="market_order",
+                            action_type="entry_guard_close",
+                            symbol=entry["symbol"],
+                            side=side,
+                            exchange=exchange_id,
+                            requested={"orderSide": close_side, "quantity": quantity, "reduceOnly": True},
+                            exchange_result=guard_result,
+                        )
+                        warnings.append(
+                            f"Live entry guard closed {entry['symbol']}: fill price invalidated the requested protection."
+                        )
+                    except Exception as guard_error:
+                        warnings.append(f"Live entry guard failed for {entry['symbol']}: {guard_error}")
+                        append_execution_event(
+                            execution_events,
+                            decision_id=decision_id,
+                            stage="market_order",
+                            action_type="entry_guard_close",
+                            symbol=entry["symbol"],
+                            side=side,
+                            exchange=exchange_id,
+                            requested={"quantity": quantity, "reduceOnly": True},
+                            success=False,
+                            error=guard_error,
+                        )
+                    continue
+                if settings["liveExecution"]["useExchangeProtectionOrders"]:
+                    cancel_result = cancel_all_open_orders(live_config, entry["symbol"])
+                    append_execution_event(
+                        execution_events,
+                        decision_id=decision_id,
+                        stage="cancel_open_orders",
+                        action_type="open_protection_setup",
+                        symbol=entry["symbol"],
+                        side=side,
+                        exchange=exchange_id,
+                        requested={"reason": "replace_protection_after_open"},
+                        exchange_result=cancel_result,
+                    )
+                    warnings.extend(
+                        _place_live_protection_orders_with_fallback(
                             live_config,
                             symbol=entry["symbol"],
                             position_side=side,
+                            quantity=quantity,
                             stop_loss=stop_loss,
                             take_profit=take_profit,
+                            take_profit_fraction=take_profit_fraction,
+                            warning_prefix="Exchange protection order placement failed",
+                            decision_id=decision_id,
+                            action_type="open_protection_setup",
+                            execution_events=execution_events,
                         )
-                    except Exception as error:
-                        warnings.append(f"Exchange protection order placement failed for {entry['symbol']}: {error}")
+                    )
             else:
                 open_paper_position(
                     book,
@@ -1304,6 +2590,7 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
                     side=side,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
+                    take_profit_fraction=take_profit_fraction,
                     confidence=entry["confidence"],
                     notional_usd=notional_usd,
                     reason=entry["reason"],
@@ -1320,13 +2607,14 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
                     "notionalUsd": notional_usd,
                     "stopLoss": stop_loss,
                     "takeProfit": take_profit,
+                    "takeProfitFraction": take_profit_fraction,
                     "reason": entry["reason"],
                     "label": action_label("open", entry["symbol"], side),
                 }
             )
             account_after_management = summarize_account(book, settings)
     if account_key == "live":
-        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings)
+        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings, instance_id)
         warnings.extend(live_warnings)
         state["live"] = book
     else:
@@ -1335,6 +2623,20 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
     if account_after["equityUsd"] > (num(book.get("highWatermarkEquity")) or book["initialCapitalUsd"]):
         book["highWatermarkEquity"] = account_after["equityUsd"]
     book["lastDecisionAt"] = now_iso()
+    warnings = dedupe_messages(warnings)
+    execution_events = [normalize_execution_event(item) for item in execution_events if isinstance(item, dict)]
+    if account_key == "live" and execution_events:
+        book.setdefault("executionEvents", []).extend(execution_events)
+    output_payload = {
+        "summary": parsed_model.get("summary"),
+        "positionActions": parsed_model["position_actions"],
+        "entryActions": parsed_model["entry_actions"],
+        "watchlist": parsed_model["watchlist"],
+        "providerStatus": provider_status(provider),
+        "liveExecutionStatus": live_status_payload,
+    }
+    if historical_lessons:
+        output_payload["historicalLessons"] = historical_lessons
     decision = normalize_decision(
         {
             "id": decision_id,
@@ -1344,16 +2646,10 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
             "mode": settings["mode"],
             "prompt": prompt,
             "promptSummary": one_line(parsed_model.get("summary") or f"Managed {len(account_before['openPositions'])} positions and reviewed {len(candidate_snapshots)} candidates."),
-            "output": {
-                "summary": parsed_model.get("summary"),
-                "positionActions": parsed_model["position_actions"],
-                "entryActions": parsed_model["entry_actions"],
-                "watchlist": parsed_model["watchlist"],
-                "providerStatus": provider_status(provider),
-                "liveExecutionStatus": live_status_payload,
-            },
+            "output": output_payload,
             "rawModelResponse": model_result or {},
             "actions": management_actions + breaker_actions + entry_actions,
+            "executionEvents": execution_events,
             "warnings": warnings,
             "candidateUniverse": [serialize_candidate_for_history(item) for item in candidate_snapshots],
             "accountBefore": account_before,
@@ -1369,27 +2665,29 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
             "The editable trade-logic fields affect judgment only. Market data, positions, and risk limits are always injected by the system.",
         ],
     }
-    write_trading_state(state)
-    archive_decision(decision)
+    write_trading_state(state, instance_id)
+    archive_decision(decision, instance_id)
     return {
         "settings": settings,
         "state": state,
         "decision": decision,
         "marketBackdrop": market_backdrop,
         "liveExecutionStatus": live_status_payload,
+        "instanceId": instance_id,
     }
 
 
-def run_trading_cycle_batch(reason: str = "manual", modes: list[str] | None = None) -> dict[str, Any]:
-    settings = read_trading_settings()
-    requested_modes = [clean_mode(item) for item in (modes or enabled_modes(settings))]
+def run_trading_cycle_batch(reason: str = "manual", modes: list[str] | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
+    default_modes = modes or [clean_mode(settings["mode"])]
+    requested_modes = [clean_mode(item) for item in default_modes]
     unique_modes: list[str] = []
     for mode in requested_modes:
         if mode not in unique_modes:
             unique_modes.append(mode)
     results = []
     for mode in unique_modes:
-        result = run_trading_cycle(reason=reason, mode_override=mode)
+        result = run_trading_cycle(reason=reason, mode_override=mode, instance_id=instance_id)
         results.append(
             {
                 "ok": True,
@@ -1403,28 +2701,29 @@ def run_trading_cycle_batch(reason: str = "manual", modes: list[str] | None = No
         "activeMode": unique_modes[0] if unique_modes else "paper",
         "results": results,
         "primaryResult": results[0]["result"] if results else None,
+        "instanceId": instance_id,
     }
 
 
-def preview_trading_prompt_decision(mode_override: str | None = None, prompt_override: dict[str, Any] | None = None) -> dict[str, Any]:
-    settings = read_trading_settings()
+def preview_trading_prompt_decision(mode_override: str | None = None, prompt_override: dict[str, Any] | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
     settings["mode"] = clean_mode(mode_override or settings["mode"])
-    universe = read_fixed_universe()
+    universe = read_fixed_universe(instance_id)
     account_key = account_key_for_mode(settings["mode"])
     cycle_exchange_id = str(settings.get("activeExchange") or "binance").strip().lower() or "binance"
     if account_key == "live":
-        live_config = read_live_trading_config()
+        live_config = read_live_trading_config(instance_id)
         cycle_exchange_id = str(live_config.get("exchange") or cycle_exchange_id).strip().lower() or cycle_exchange_id
-    scan = read_latest_scan(cycle_exchange_id)
+    scan = read_latest_scan(cycle_exchange_id, instance_id)
     if universe.get("dynamicSource", {}).get("enabled") or not scan["opportunities"] or str(scan.get("exchange") or "").strip().lower() != cycle_exchange_id:
-        scan = refresh_candidate_pool(cycle_exchange_id)
-    state = read_trading_state(settings)
+        scan = refresh_candidate_pool(cycle_exchange_id, instance_id)
+    state = read_trading_state(settings, instance_id)
     book = deepcopy(state[account_key])
     warnings: list[str] = []
     if account_key == "live":
-        book, live_warnings, _, _ = sync_live_book(book, settings)
+        book, live_warnings, _, _ = sync_live_book(book, settings, instance_id)
         warnings.extend(live_warnings)
-    prompt_settings = prompt_override or read_prompt_settings()
+    prompt_settings = prompt_override or read_prompt_settings(instance_id)
     prompt_kline_feeds = prompt_settings.get("klineFeeds") if isinstance(prompt_settings.get("klineFeeds"), dict) else {}
     raw_candidates = candidate_universe_from_scan(scan)
     symbols = []
@@ -1449,7 +2748,12 @@ def preview_trading_prompt_decision(mode_override: str | None = None, prompt_ove
         candidate_snapshots.append(build_candidate_snapshot(opportunity, live, settings, cycle_exchange_id))
     candidates_by_symbol = {item["symbol"]: item for item in candidate_snapshots}
     account_summary = summarize_account(book, settings)
-    provider = read_llm_provider()
+    provider = read_llm_provider(instance_id)
+    historical_lessons = historical_lessons_for_prompt(
+        instance_id=instance_id,
+        settings=settings,
+        candidates=candidate_snapshots,
+    )
     prompt = build_prompt(
         settings=settings,
         prompt_settings=prompt_settings,
@@ -1459,14 +2763,16 @@ def preview_trading_prompt_decision(mode_override: str | None = None, prompt_ove
         open_positions=account_summary["openPositions"],
         open_orders=[normalize_order(item) for item in book.get("openOrders", [])],
         candidates=candidate_snapshots,
+        historical_lessons=historical_lessons,
     )
-    model_result = generate_trading_decision(prompt, provider)
+    model_result = generate_trading_decision(prompt, provider, read_network_settings(instance_id))
     parsed_model = normalize_model_decision(
         model_result["parsed"],
         open_positions=account_summary["openPositions"],
         candidates_by_symbol=candidates_by_symbol,
     )
-    return {
+    warnings = dedupe_messages(warnings)
+    result = {
         "mode": settings["mode"],
         "promptName": prompt_settings.get("name") or "default_trading_logic",
         "candidateCount": len(candidate_snapshots),
@@ -1476,7 +2782,11 @@ def preview_trading_prompt_decision(mode_override: str | None = None, prompt_ove
         "rawText": model_result["rawText"],
         "parsed": parsed_model,
         "provider": model_result["provider"],
+        "instanceId": instance_id,
     }
+    if historical_lessons:
+        result["historicalLessons"] = historical_lessons
+    return result
 def _parse_iso_timestamp(value: Any) -> float | None:
     if not value:
         return None
@@ -1486,8 +2796,9 @@ def _parse_iso_timestamp(value: Any) -> float | None:
         return None
 
 
-def archived_decision_timeline(mode: str, session_started_at: str | None, limit: int = 1000) -> list[dict[str, Any]]:
-    if not DECISIONS_DIR.exists():
+def archived_decision_timeline(mode: str, session_started_at: str | None, limit: int = 1000, instance_id: str | None = None) -> list[dict[str, Any]]:
+    decisions_dir = _decisions_dir(instance_id)
+    if not decisions_dir.exists():
         return []
     started_ts = _parse_iso_timestamp(session_started_at)
     started_date = None
@@ -1497,7 +2808,7 @@ def archived_decision_timeline(mode: str, session_started_at: str | None, limit:
         except Exception:
             started_date = None
     rows: list[dict[str, Any]] = []
-    for day_dir in sorted(DECISIONS_DIR.iterdir()):
+    for day_dir in sorted(decisions_dir.iterdir()):
         if not day_dir.is_dir():
             continue
         if started_date and day_dir.name < started_date:
@@ -1530,9 +2841,9 @@ def archived_decision_timeline(mode: str, session_started_at: str | None, limit:
     return rows[-limit:]
 
 
-def summarize_book_history(book: dict[str, Any], mode: str) -> dict[str, Any]:
+def summarize_book_history(book: dict[str, Any], mode: str, instance_id: str | None = None) -> dict[str, Any]:
     recent_decisions = list(book.get("decisions", []))[-8:]
-    archived_timeline = archived_decision_timeline(mode, book.get("sessionStartedAt"))
+    archived_timeline = archived_decision_timeline(mode, book.get("sessionStartedAt"), instance_id=instance_id)
     decision_timeline = archived_timeline or [
         {
             "id": item["id"],
@@ -1549,6 +2860,7 @@ def summarize_book_history(book: dict[str, Any], mode: str) -> dict[str, Any]:
         "decisions": recent_decisions,
         "decisionTimeline": decision_timeline,
         "exchangeClosedTrades": list(book.get("exchangeClosedTrades", [])),
+        "executionEvents": list(book.get("executionEvents", []))[-80:],
         "closedTrades": list(book.get("closedTrades", [])),
     }
 
@@ -1567,11 +2879,12 @@ def compact_latest_decision(decision: dict[str, Any] | None) -> dict[str, Any] |
     }
 
 
-def summarize_trading_state() -> dict[str, Any]:
-    settings = read_trading_settings()
-    state = read_trading_state(settings)
-    live_status_payload = live_execution_status(read_live_trading_config(), settings)
-    scan = read_latest_scan(settings.get("activeExchange"))
+def summarize_trading_state(instance_id: str | None = None, *, include_live_status: bool = True) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
+    state = read_trading_state(settings, instance_id)
+    live_status_payload = live_execution_status(read_live_trading_config(instance_id), settings) if include_live_status else None
+    scan = read_latest_scan(settings.get("activeExchange"), instance_id)
+    exchange_cooldown = cooldown_status(settings.get("activeExchange") or "binance")
     active_mode = settings["mode"]
     active_key = account_key_for_mode(active_mode)
     active_book = state[active_key]
@@ -1598,34 +2911,60 @@ def summarize_trading_state() -> dict[str, Any]:
         "paperBook": state["paper"],
         "liveBook": state["live"],
         "activeBook": active_book,
-        "paperHistory": summarize_book_history(state["paper"], "paper"),
-        "liveHistory": summarize_book_history(state["live"], "live"),
+        "paperHistory": summarize_book_history(state["paper"], "paper", instance_id),
+        "liveHistory": summarize_book_history(state["live"], "live", instance_id),
         "liveExecutionStatus": live_status_payload,
-        "providerStatus": provider_status(),
+        "exchangeCooldown": exchange_cooldown,
+        "providerStatus": provider_status(read_llm_provider(instance_id)),
+        "instance": read_instance(instance_id) if instance_id else None,
     }
 
 
-def flatten_active_account(reason: str = "manual_flatten", mode_override: str | None = None) -> dict[str, Any]:
-    settings = read_trading_settings()
+def flatten_active_account(reason: str = "manual_flatten", mode_override: str | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
     target_mode = clean_mode(mode_override or settings["mode"])
-    state = read_trading_state(settings)
+    state = read_trading_state(settings, instance_id)
     account_key = account_key_for_mode(target_mode)
     book = state[account_key]
     decision_id = f"flatten-{int(__import__('time').time() * 1000)}"
     actions = []
     warnings: list[str] = []
+    execution_events: list[dict[str, Any]] = []
     if account_key == "live":
-        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings)
+        book, live_warnings, live_status_payload, live_config = sync_live_book(book, settings, instance_id)
         warnings.extend(live_warnings)
         if not live_status_payload["canExecute"]:
             raise RuntimeError("Live flatten requires real execution to be enabled.")
+        exchange_id = str(live_config.get("exchange") or "").strip().lower()
         for position in list(book.get("openPositions", [])):
-            cancel_all_open_orders(live_config, position["symbol"])
+            cancel_result = cancel_all_open_orders(live_config, position["symbol"])
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="cancel_open_orders",
+                action_type="manual_flatten",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"reason": reason},
+                exchange_result=cancel_result,
+            )
             side = "SELL" if position["side"] == "long" else "BUY"
-            place_market_order(live_config, symbol=position["symbol"], side=side, quantity=position["quantity"], reduce_only=True)
+            order_result = place_market_order(live_config, symbol=position["symbol"], side=side, quantity=position["quantity"], reduce_only=True)
+            append_execution_event(
+                execution_events,
+                decision_id=decision_id,
+                stage="market_order",
+                action_type="manual_flatten",
+                symbol=position["symbol"],
+                side=position["side"],
+                exchange=exchange_id,
+                requested={"orderSide": side, "quantity": position["quantity"], "reduceOnly": True},
+                exchange_result=order_result,
+            )
             book, action = close_position(book, position, num(position.get("lastMarkPrice")) or num(position.get("entryPrice")) or 0, decision_id, reason)
             actions.append(action)
-        book, live_warnings, _, _ = sync_live_book(book, settings)
+        book, live_warnings, _, _ = sync_live_book(book, settings, instance_id)
         warnings.extend(live_warnings)
     else:
         for position in list(book.get("openPositions", [])):
@@ -1641,6 +2980,7 @@ def flatten_active_account(reason: str = "manual_flatten", mode_override: str | 
             "prompt": f"Flatten all open {target_mode} positions because: {reason}",
             "promptSummary": f"Flattened {len(actions)} open {target_mode} positions.",
             "actions": actions,
+            "executionEvents": execution_events,
             "warnings": warnings,
             "output": {"actions": actions},
             "candidateUniverse": [],
@@ -1649,15 +2989,17 @@ def flatten_active_account(reason: str = "manual_flatten", mode_override: str | 
         }
     )
     book.setdefault("decisions", []).append(decision)
+    if account_key == "live" and execution_events:
+        book.setdefault("executionEvents", []).extend(execution_events)
     book["lastDecisionAt"] = now_iso()
-    write_trading_state(state)
-    archive_decision(decision)
+    write_trading_state(state, instance_id)
+    archive_decision(decision, instance_id)
     return state
 
 
-def reset_paper_account(mode: str = "full") -> dict[str, Any]:
-    settings = read_trading_settings()
-    state = read_trading_state(settings)
+def reset_paper_account(mode: str = "full", instance_id: str | None = None) -> dict[str, Any]:
+    settings = read_trading_settings(instance_id)
+    state = read_trading_state(settings, instance_id)
     if str(mode) == "equity_only":
         state["paper"]["initialCapitalUsd"] = settings["initialCapitalUsd"]
         state["paper"]["highWatermarkEquity"] = settings["initialCapitalUsd"]
@@ -1665,6 +3007,7 @@ def reset_paper_account(mode: str = "full") -> dict[str, Any]:
         state["paper"]["openOrders"] = []
         state["paper"]["closedTrades"] = []
         state["paper"]["decisions"] = []
+        state["paper"]["executionEvents"] = []
         state["paper"]["lastDecisionAt"] = None
         state["paper"]["sessionStartedAt"] = now_iso()
         state["paper"]["circuitBreakerTripped"] = False
@@ -1679,21 +3022,21 @@ def reset_paper_account(mode: str = "full") -> dict[str, Any]:
             "The trade-logic fields, provider config, and proxy config were preserved.",
         ],
     }
-    return write_trading_state(state)
+    return write_trading_state(state, instance_id)
 
 
-def reset_trading_account(mode: str = "paper") -> dict[str, Any]:
+def reset_trading_account(mode: str = "paper", instance_id: str | None = None) -> dict[str, Any]:
     reset_mode = str(mode or "paper").strip().lower()
     if reset_mode in {"paper", "full", "equity_only"}:
-        return reset_paper_account(reset_mode if reset_mode == "equity_only" else "full")
+        return reset_paper_account(reset_mode if reset_mode == "equity_only" else "full", instance_id)
 
     if reset_mode != "live":
         raise ValueError(f"Unsupported reset mode: {mode}")
 
-    settings = read_trading_settings()
-    state = read_trading_state(settings)
+    settings = read_trading_settings(instance_id)
+    state = read_trading_state(settings, instance_id)
     book = state["live"]
-    book, warnings, live_status_payload, live_config = sync_live_book(book, settings)
+    book, warnings, live_status_payload, live_config = sync_live_book(book, settings, instance_id)
     state["live"] = book
     if not live_status_payload["canSync"]:
         state["live"] = empty_trading_account(settings["initialCapitalUsd"], "exchange")
@@ -1704,7 +3047,7 @@ def reset_trading_account(mode: str = "paper") -> dict[str, Any]:
                 "No valid live API configuration was available, so only local live decisions, positions, and drawdown baseline were cleared.",
             ],
         }
-        return write_trading_state(state)
+        return write_trading_state(state, instance_id)
     if book.get("openPositions"):
         if not live_status_payload["canExecute"]:
             raise RuntimeError("实盘重置发现当前仍有持仓。请先启用实盘并关闭模拟下单，或先手动全部平仓。")
@@ -1719,7 +3062,7 @@ def reset_trading_account(mode: str = "paper") -> dict[str, Any]:
                 reduce_only=True,
             )
     fresh_book = empty_trading_account(num(book.get("exchangeEquityUsd")) or settings["initialCapitalUsd"], "exchange")
-    fresh_book, sync_warnings, _, _ = sync_live_book(fresh_book, settings)
+    fresh_book, sync_warnings, _, _ = sync_live_book(fresh_book, settings, instance_id)
     warnings.extend(sync_warnings)
     state["live"] = fresh_book
     state["adaptive"] = {
@@ -1729,4 +3072,4 @@ def reset_trading_account(mode: str = "paper") -> dict[str, Any]:
             "Live decisions, local estimated realized PnL, drawdown baseline, and synced positions were cleared.",
         ] + ([f"Reset warnings: {'; '.join(warnings[:3])}"] if warnings else []),
     }
-    return write_trading_state(state)
+    return write_trading_state(state, instance_id)

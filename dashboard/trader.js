@@ -1,6 +1,8 @@
 const THEME_STORAGE_KEY = "gs-ai-trader-theme";
 const TAB_STORAGE_KEY = "gs-ai-trader-tab";
 const MODE_STORAGE_KEY = "gs-ai-trader-mode";
+const INSTANCE_ID = new URLSearchParams(window.location.search).get("instance");
+const INSTANCE_API_BASE = INSTANCE_ID ? `/api/instances/${encodeURIComponent(INSTANCE_ID)}` : null;
 
 const PROVIDER_DEFAULTS = {
   gpt: {
@@ -10,6 +12,10 @@ const PROVIDER_DEFAULTS = {
   claude: {
     apiStyle: "anthropic",
     baseUrl: "https://api.anthropic.com/v1"
+  },
+  kimi: {
+    apiStyle: "openai",
+    baseUrl: "https://api.moonshot.ai/v1"
   },
   deepseek: {
     apiStyle: "openai",
@@ -48,6 +54,14 @@ const PROVIDER_MODEL_OPTIONS = {
     "claude-3-5-sonnet-latest",
     "claude-3-5-haiku-latest"
   ],
+  kimi: [
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "kimi-k2-thinking",
+    "kimi-k2-thinking-turbo",
+    "kimi-k2-turbo-preview",
+    "kimi-k2-0905-preview"
+  ],
   deepseek: [
     "deepseek-chat",
     "deepseek-reasoner"
@@ -60,6 +74,8 @@ const PROVIDER_MODEL_OPTIONS = {
   custom: [
     "gpt-5.4-mini",
     "claude-opus-4-7",
+    "kimi-k2.6",
+    "kimi-k2.5",
     "deepseek-chat",
     "qwen-plus",
     "gpt-4.1-mini"
@@ -145,6 +161,7 @@ const state = {
   latest: null,
   scan: null,
   settings: null,
+  instance: null,
   tradingState: null,
   tradingSettings: null,
   provider: null,
@@ -172,11 +189,41 @@ const state = {
   }
 };
 
+function resolveApiUrl(url) {
+  if (!INSTANCE_API_BASE || typeof url !== "string") return url;
+  const mapping = {
+    "/api/latest": `${INSTANCE_API_BASE}/latest`,
+    "/api/opportunities": `${INSTANCE_API_BASE}/opportunities`,
+    "/api/logs": `${INSTANCE_API_BASE}/logs`,
+    "/api/trading/settings": `${INSTANCE_API_BASE}/trading/settings`,
+    "/api/trading/provider": `${INSTANCE_API_BASE}/provider`,
+    "/api/trading/universe": `${INSTANCE_API_BASE}/universe`,
+    "/api/trading/universe/test": `${INSTANCE_API_BASE}/universe/test`,
+    "/api/trading/prompt": `${INSTANCE_API_BASE}/prompt`,
+    "/api/trading/prompt-library": `${INSTANCE_API_BASE}/prompt-library`,
+    "/api/trading/prompt-library/save": `${INSTANCE_API_BASE}/prompt-library/save`,
+    "/api/trading/prompt-library/use": `${INSTANCE_API_BASE}/prompt-library/use`,
+    "/api/trading/prompt-library/rename": `${INSTANCE_API_BASE}/prompt-library/rename`,
+    "/api/trading/prompt-library/delete": `${INSTANCE_API_BASE}/prompt-library/delete`,
+    "/api/trading/prompt/test": `${INSTANCE_API_BASE}/prompt/test`,
+    "/api/trading/live-config": `${INSTANCE_API_BASE}/live-config`,
+    "/api/network": `${INSTANCE_API_BASE}/network`,
+    "/api/network/ip": `${INSTANCE_API_BASE}/network/ip`,
+    "/api/trading/state": `${INSTANCE_API_BASE}/state`,
+    "/api/trading/run": `${INSTANCE_API_BASE}/run`,
+    "/api/trading/reset": `${INSTANCE_API_BASE}/reset`,
+    "/api/trading/flatten": `${INSTANCE_API_BASE}/flatten`,
+    "/api/scan/run": `${INSTANCE_API_BASE}/scan/run`
+  };
+  return mapping[url] || url;
+}
+
 const els = {
   tradeRunMeta: document.querySelector("#tradeRunMeta"),
   tradeRefreshHint: document.querySelector("#tradeRefreshHint"),
   themeToggleBtn: document.querySelector("#themeToggleBtn"),
   toggleModeBtn: document.querySelector("#toggleModeBtn"),
+  cloneLiveBtn: document.querySelector("#cloneLiveBtn"),
   flattenBtn: document.querySelector("#flattenBtn"),
   resetBtn: document.querySelector("#resetBtn"),
   refreshBtn: document.querySelector("#refreshBtn"),
@@ -197,6 +244,8 @@ const els = {
   closedPositionList: document.querySelector("#closedPositionList"),
   candidateMeta: document.querySelector("#candidateMeta"),
   candidateList: document.querySelector("#candidateList"),
+  learningMeta: document.querySelector("#learningMeta"),
+  learningPanel: document.querySelector("#learningPanel"),
   decisionMeta: document.querySelector("#decisionMeta"),
   decisionLog: document.querySelector("#decisionLog"),
   tradingSettingsForm: document.querySelector("#tradingSettingsForm"),
@@ -214,6 +263,7 @@ const els = {
   paperFeesRow: document.querySelector("#paperFeesRow"),
   paperFeesInput: document.querySelector("#paperFeesInput"),
   allowShortsInput: document.querySelector("#allowShortsInput"),
+  selfLearningEnabledInput: document.querySelector("#selfLearningEnabledInput"),
   pageAutoRefreshInput: document.querySelector("#pageAutoRefreshInput"),
   settingsFeedback: document.querySelector("#settingsFeedback"),
   providerForm: document.querySelector("#providerForm"),
@@ -225,6 +275,7 @@ const els = {
   providerCustomModelInput: document.querySelector("#providerCustomModelInput"),
   providerBaseUrlInput: document.querySelector("#providerBaseUrlInput"),
   providerApiKeyInput: document.querySelector("#providerApiKeyInput"),
+  providerBypassProxyInput: document.querySelector("#providerBypassProxyInput"),
   providerAdvancedToggleBtn: document.querySelector("#providerAdvancedToggleBtn"),
   providerAdvancedFields: document.querySelector("#providerAdvancedFields"),
   providerTimeoutInput: document.querySelector("#providerTimeoutInput"),
@@ -366,7 +417,17 @@ function modeName(mode) {
 }
 
 function currentViewMode() {
+  if (state.instance?.type === "live") return "live";
+  if (state.instance?.type === "paper") return "paper";
   return state.viewMode === "live" ? "live" : "paper";
+}
+
+function syncDocumentTitle() {
+  const instanceName = String(state.instance?.name || "").trim();
+  const mode = currentViewMode();
+  document.title = instanceName
+    ? `AITD - ${modeName(mode)} - ${instanceName}`
+    : "AITD";
 }
 
 function fmtDateTime(value) {
@@ -381,6 +442,29 @@ function fmtDateTime(value) {
     second: "2-digit",
     hour12: false
   });
+}
+
+function fmtDurationSeconds(value) {
+  const seconds = Math.max(0, Math.ceil(Number(value) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes <= 0) return `${rest} 秒`;
+  return `${minutes} 分 ${rest} 秒`;
+}
+
+function exchangeCooldownText(cooldown) {
+  if (!cooldown || !cooldown.active) return "";
+  const exchange = String(cooldown.exchange || "binance").toUpperCase();
+  const until = fmtDateTime(cooldown.untilAt);
+  const remaining = fmtDurationSeconds(cooldown.remainingSeconds);
+  return `${exchange} API 冷却中，预计到 ${until}，剩余 ${remaining}`;
+}
+
+function renderExchangeCooldownNotice(cooldown) {
+  const text = exchangeCooldownText(cooldown);
+  if (!text) return "";
+  const reason = cooldown.reason ? ` · ${cooldown.reason}` : "";
+  return `<div class="exchange-cooldown-banner"><strong>${escapeHtml(text)}</strong><span>${escapeHtml(reason)}</span></div>`;
 }
 
 function parseSortTime(value) {
@@ -520,8 +604,12 @@ function buildDecisionActionDetails(decision) {
       const quantity = Number(after?.quantity ?? before?.quantity);
       const stopLoss = action?.stopLoss ?? after?.stopLoss;
       const takeProfit = action?.takeProfit ?? after?.takeProfit;
+      const takeProfitFraction = Number(action?.takeProfitFraction ?? after?.takeProfitFraction);
       const qtyText = Number.isFinite(quantity) ? fmtNumber(quantity, 4) : "n/a";
-      lines.push(`${symbol} ${sideLabel}单 ${qtyText} | 止损 ${fmtPrice(stopLoss)} | 止盈 ${fmtPrice(takeProfit)}`);
+      const tpSuffix = Number.isFinite(takeProfitFraction) && takeProfitFraction > 0 && takeProfitFraction < 0.999
+        ? ` (${fmtPct(takeProfitFraction * 100, 0)})`
+        : "";
+      lines.push(`${symbol} ${sideLabel}单 ${qtyText} | 止损 ${fmtPrice(stopLoss)} | 止盈 ${fmtPrice(takeProfit)}${tpSuffix}`);
       return;
     }
     lines.push(`${symbol || "仓位"} ${actionKindLabel(type)}`);
@@ -544,7 +632,7 @@ function applyTheme(theme) {
 }
 
 function setActiveTab(tab) {
-  const nextTab = ["trade", "prompt", "universe", "log"].includes(tab) ? tab : "trade";
+  const nextTab = ["trade", "learning", "prompt", "universe", "log"].includes(tab) ? tab : "trade";
   state.activeTab = nextTab;
   writeStoredValue(TAB_STORAGE_KEY, nextTab);
   els.tabButtons.forEach((button) => {
@@ -561,14 +649,14 @@ function setActiveTab(tab) {
 }
 
 async function getJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch(resolveApiUrl(url), { cache: "no-store" });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || `${response.status} ${response.statusText}`);
   return payload;
 }
 
 async function postJson(url, body = {}) {
-  const response = await fetch(url, {
+  const response = await fetch(resolveApiUrl(url), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
@@ -629,7 +717,7 @@ function liveClosedDisplaySource() {
         notionalUsd: trade.notionalUsd,
         realizedPnl: trade.realizedPnl,
         closedAt: trade.closedAt,
-        info: trade.info || "交易所已实现记录"
+        info: trade.info || "交易所成交明细"
       }))
     };
   }
@@ -745,21 +833,17 @@ function groupedPaperClosedTrades() {
 }
 
 function currentRunner() {
-  return currentViewMode() === "live"
-    ? (state.tradingState?.liveRunner || {})
-    : (state.tradingState?.paperRunner || {});
+  return state.tradingState?.tradeRunner || {};
 }
 
 function currentRunnerEnabled() {
   return currentViewMode() === "live"
-    ? state.tradingState?.liveTradingEnabled === true
-    : state.tradingState?.paperTradingEnabled === true;
+    ? state.tradingState?.settings?.liveTrading?.enabled === true
+    : state.tradingState?.settings?.paperTrading?.enabled === true;
 }
 
 function currentNextDueAt() {
-  return currentViewMode() === "live"
-    ? state.tradingState?.liveNextDecisionDueAt
-    : state.tradingState?.paperNextDecisionDueAt;
+  return state.tradingState?.nextDecisionDueAt;
 }
 
 function desiredCandidateExchange() {
@@ -939,7 +1023,6 @@ function renderEquityChart() {
         <svg viewBox="0 0 ${width} ${height}" class="equity-chart-svg" aria-label="Equity chart" preserveAspectRatio="none">
           <path d="${areaPath}" class="equity-chart-area"></path>
           <polyline points="${polyline}" class="equity-chart-line"></polyline>
-          ${points.map((point) => `<circle cx="${point.x}" cy="${point.y}" r="3" class="equity-chart-point"></circle>`).join("")}
           ${points.map((point) => `
             <circle
               cx="${point.x}"
@@ -1115,6 +1198,7 @@ function buildProviderPayload() {
     model: currentProviderModel(),
     baseUrl: els.providerBaseUrlInput.value.trim(),
     apiKey: els.providerApiKeyInput.value.trim(),
+    bypassProxy: els.providerBypassProxyInput.checked,
     timeoutSeconds: Number(els.providerTimeoutInput.value || 45),
     temperature: Number(els.providerTemperatureInput.value || 0.2),
     maxOutputTokens: Number(els.providerMaxTokensInput.value || 1200)
@@ -1167,6 +1251,9 @@ function normalizePromptKlineFeeds(value) {
       limit: Math.max(1, Math.min(300, Number(raw.limit || PROMPT_KLINE_FEED_DEFAULTS[interval].limit)))
     };
   });
+  if (!PROMPT_KLINE_FEED_OPTIONS.some((interval) => feeds[interval].enabled)) {
+    feeds["15m"].enabled = true;
+  }
   return feeds;
 }
 
@@ -1196,7 +1283,14 @@ function syncPromptKlineInputs() {
   });
 }
 
-function handlePromptKlineEnabledChange() {
+function handlePromptKlineEnabledChange(changedInterval) {
+  const feeds = currentPromptKlineFeeds();
+  const enabledIntervals = PROMPT_KLINE_FEED_OPTIONS.filter((interval) => feeds[interval].enabled);
+  if (!enabledIntervals.length) {
+    const fallback = changedInterval && PROMPT_KLINE_FEED_OPTIONS.includes(changedInterval) ? changedInterval : "15m";
+    const fallbackInput = els.promptKlineEnabledInputs.find((input) => input.dataset.promptKlineEnabled === fallback);
+    if (fallbackInput) fallbackInput.checked = true;
+  }
   syncPromptKlineInputs();
 }
 
@@ -1207,31 +1301,46 @@ function providerConfigMatches(expected, actual) {
     && String(actual.model || "") === String(expected.model || "")
     && String(actual.baseUrl || "") === String(expected.baseUrl || "")
     && String(actual.apiKey || "") === String(expected.apiKey || "")
+    && Boolean(actual.bypassProxy) === Boolean(expected.bypassProxy)
     && Number(actual.timeoutSeconds || 0) === Number(expected.timeoutSeconds || 0)
     && Number(actual.temperature || 0) === Number(expected.temperature || 0)
     && Number(actual.maxOutputTokens || 0) === Number(expected.maxOutputTokens || 0);
 }
 
-function tradingSettingsMatch(expectedTrading, actualTrading, expectedDashboard, actualDashboard) {
+function tradingSettingsDiffs(expectedTrading, actualTrading, expectedDashboard, actualDashboard) {
   const trading = actualTrading || {};
   const settings = actualDashboard || {};
-  return String(trading.activeExchange || "") === String(expectedTrading.activeExchange || "")
-    && Number(trading.decisionIntervalMinutes || 0) === Number(expectedTrading.decisionIntervalMinutes || 0)
-    && Number(trading.initialCapitalUsd || 0) === Number(expectedTrading.initialCapitalUsd || 0)
-    && Number(trading.maxNewPositionsPerCycle || 0) === Number(expectedTrading.maxNewPositionsPerCycle || 0)
-    && Number(trading.maxOpenPositions || 0) === Number(expectedTrading.maxOpenPositions || 0)
-    && Number(trading.maxPositionNotionalUsd || 0) === Number(expectedTrading.maxPositionNotionalUsd || 0)
-    && Number(trading.maxGrossExposurePct || 0) === Number(expectedTrading.maxGrossExposurePct || 0)
-    && Number(trading.maxAccountDrawdownPct || 0) === Number(expectedTrading.maxAccountDrawdownPct || 0)
-    && Number(trading.riskPerTradePct || 0) === Number(expectedTrading.riskPerTradePct || 0)
-    && Number(trading.minConfidence || 0) === Number(expectedTrading.minConfidence || 0)
-    && Number(trading.paperFeesBps || 0) === Number(expectedTrading.paperFeesBps || 0)
-    && Boolean(trading.allowShorts) === Boolean(expectedTrading.allowShorts)
-    && Number(settings.pageAutoRefreshSeconds || 0) === Number(expectedDashboard.pageAutoRefreshSeconds || 0);
+  const diffs = [];
+  const compare = (label, expectedValue, actualValue) => {
+    if (expectedValue !== actualValue) {
+      diffs.push(`${label}=${actualValue}（期望 ${expectedValue}）`);
+    }
+  };
+  compare("交易所", String(expectedTrading.activeExchange || ""), String(trading.activeExchange || ""));
+  compare("决策间隔", Number(expectedTrading.decisionIntervalMinutes || 0), Number(trading.decisionIntervalMinutes || 0));
+  compare("初始本金", Number(expectedTrading.initialCapitalUsd || 0), Number(trading.initialCapitalUsd || 0));
+  compare("每轮最多新开仓", Number(expectedTrading.maxNewPositionsPerCycle || 0), Number(trading.maxNewPositionsPerCycle || 0));
+  compare("最多持仓品种", Number(expectedTrading.maxOpenPositions || 0), Number(trading.maxOpenPositions || 0));
+  compare("单笔最大市值", Number(expectedTrading.maxPositionNotionalUsd || 0), Number(trading.maxPositionNotionalUsd || 0));
+  compare("总敞口上限", Number(expectedTrading.maxGrossExposurePct || 0), Number(trading.maxGrossExposurePct || 0));
+  compare("账户最大回撤", Number(expectedTrading.maxAccountDrawdownPct || 0), Number(trading.maxAccountDrawdownPct || 0));
+  compare("单笔风险", Number(expectedTrading.riskPerTradePct || 0), Number(trading.riskPerTradePct || 0));
+  compare("最低置信度", Number(expectedTrading.minConfidence || 0), Number(trading.minConfidence || 0));
+  compare("模拟手续费", Number(expectedTrading.paperFeesBps || 0), Number(trading.paperFeesBps || 0));
+  compare("允许做空", Boolean(expectedTrading.allowShorts), Boolean(trading.allowShorts));
+  compare("自学习经验注入", Boolean(expectedTrading.selfLearning?.enabled), Boolean(trading.selfLearning?.enabled));
+  compare("页面刷新", Number(expectedDashboard.pageAutoRefreshSeconds || 0), Number(settings.pageAutoRefreshSeconds || 0));
+  return diffs;
 }
 
-function tradingSettingsMismatchMessage(actualTrading, actualDashboard) {
-  return `运行设置保存后读回不一致：交易所=${actualTrading?.activeExchange ?? "n/a"}，决策间隔=${actualTrading?.decisionIntervalMinutes ?? "n/a"} 分钟，页面刷新=${actualDashboard?.pageAutoRefreshSeconds ?? "n/a"} 秒。请检查 Log。`;
+function tradingSettingsMatch(expectedTrading, actualTrading, expectedDashboard, actualDashboard) {
+  return tradingSettingsDiffs(expectedTrading, actualTrading, expectedDashboard, actualDashboard).length === 0;
+}
+
+function tradingSettingsMismatchMessage(expectedTrading, actualTrading, expectedDashboard, actualDashboard) {
+  const diffs = tradingSettingsDiffs(expectedTrading, actualTrading, expectedDashboard, actualDashboard);
+  if (!diffs.length) return "运行设置已保存并校验成功。";
+  return `运行设置保存后读回不一致：${diffs.slice(0, 6).join("；")}。请检查 Log。`;
 }
 
 function networkSettingsMatch(expected, actual) {
@@ -1452,7 +1561,8 @@ function syncTradingSettingsForm() {
   els.minConfidenceInput.value = settings.minConfidence ?? 60;
   els.paperFeesInput.value = settings.paperFeesBps ?? 4;
   els.allowShortsInput.checked = settings.allowShorts !== false;
-  els.pageAutoRefreshInput.value = state.settings?.pageAutoRefreshSeconds ?? 600;
+  els.selfLearningEnabledInput.checked = settings.selfLearning?.enabled === true;
+  els.pageAutoRefreshInput.value = state.settings?.pageAutoRefreshSeconds ?? 60;
 }
 
 function syncProviderForm() {
@@ -1462,6 +1572,7 @@ function syncProviderForm() {
   refreshProviderModelOptions(provider.model || providerModelsForPreset(provider.preset || "gpt")[0] || "");
   els.providerBaseUrlInput.value = provider.baseUrl || "";
   els.providerApiKeyInput.value = provider.apiKey || "";
+  els.providerBypassProxyInput.checked = provider.bypassProxy === true;
   els.providerTimeoutInput.value = provider.timeoutSeconds ?? 45;
   els.providerTemperatureInput.value = provider.temperature ?? 0.2;
   els.providerMaxTokensInput.value = provider.maxOutputTokens ?? 1200;
@@ -1529,13 +1640,18 @@ function renderMeta() {
   const nextDue = nextDueRaw ? fmtDateTime(nextDueRaw) : "n/a";
   const lastFinished = runner.lastFinishedAt ? fmtDateTime(runner.lastFinishedAt) : "尚未执行";
   const status = runner.running ? "正在执行" : "空闲";
-  els.tradeRunMeta.textContent = `${modeName(mode)} · ${status} · 上次完成 ${lastFinished} · 下次调度 ${nextDue}`;
-  const refreshSeconds = state.settings?.pageAutoRefreshSeconds || 600;
+  const instanceName = state.instance?.name || "实例";
+  const cooldown = state.tradingState?.exchangeCooldown || state.tradingState?.liveExecutionStatus?.cooldown;
+  const cooldownSuffix = exchangeCooldownText(cooldown);
+  syncDocumentTitle();
+  els.tradeRunMeta.textContent = `${instanceName} · ${modeName(mode)} · ${status} · 上次完成 ${lastFinished} · 下次调度 ${nextDue}${cooldownSuffix ? ` · ${cooldownSuffix}` : ""}`;
+  const refreshSeconds = state.settings?.pageAutoRefreshSeconds || 30;
   els.tradeRefreshHint.textContent = `自动刷新 ${refreshSeconds} 秒`;
-  els.toggleModeBtn.textContent = mode === "live" ? "查看模拟盘" : "查看实盘";
+  els.toggleModeBtn.textContent = "返回工作台";
+  els.cloneLiveBtn.hidden = state.instance?.type !== "paper";
   els.resetBtn.hidden = false;
   els.resetBtn.textContent = mode === "live" ? "重置实盘" : "重置模拟盘";
-  els.liveConfigSection.hidden = mode !== "live";
+  els.liveConfigSection.hidden = state.instance?.type !== "live";
   els.paperFeesInput.disabled = mode === "live";
   els.paperFeesRow.classList.toggle("disabled-setting", mode === "live");
   const enabled = currentRunnerEnabled();
@@ -1549,9 +1665,11 @@ function renderAccount() {
   const account = activeAccount();
   const liveStatus = state.tradingState?.liveExecutionStatus || {};
   const providerStatus = state.tradingState?.providerStatus || {};
+  const exchangeCooldown = state.tradingState?.exchangeCooldown || liveStatus.cooldown;
   const mode = currentViewMode();
+  const instanceName = state.instance?.name || mode.toUpperCase();
   const liveReconcile = mode === "live" && account.accountSource === "exchange";
-  els.modeText.textContent = mode.toUpperCase();
+  els.modeText.textContent = `${instanceName} · ${mode.toUpperCase()}`;
   els.equityText.textContent = fmtUsd(account.equityUsd);
   els.openCountText.textContent = String((account.openPositions || []).length);
   els.drawdownText.textContent = fmtPct(account.drawdownPct);
@@ -1561,6 +1679,7 @@ function renderAccount() {
     els.accountMeta.textContent = `${mode.toUpperCase()} · Realized ${fmtUsd(account.realizedPnlUsd)} · Unrealized ${fmtUsd(account.unrealizedPnlUsd)} · Gross ${fmtUsd(account.grossExposureUsd)}`;
   }
   els.accountGrid.innerHTML = `
+    ${renderExchangeCooldownNotice(exchangeCooldown)}
     <div class="account-panel-grid">
       <div class="compact-table bare-table">
         <div class="compact-row compact-header compact-account-grid">
@@ -1603,9 +1722,13 @@ function renderAccount() {
     </div>
   `;
   wireEquityChartTooltip();
+  const rawLiveIssueTexts = mode === "live" ? (liveStatus.issues || []).map((item) => `实盘账号配置：${item}`) : [];
+  const liveIssueTexts = rawLiveIssueTexts.filter((item) => !item.includes("cooldown") && !item.includes("冷却"));
+  const cooldownIssue = exchangeCooldown?.active ? exchangeCooldownText(exchangeCooldown) : "";
   const issues = [
     ...(providerStatus.issues || []).map((item) => `AI模型配置：${item}`),
-    ...(mode === "live" ? (liveStatus.issues || []).map((item) => `实盘账号配置：${item}`) : []),
+    ...liveIssueTexts,
+    ...(cooldownIssue ? [cooldownIssue] : []),
     ...(liveReconcile ? ["实盘账户汇总优先使用交易所同步到的真实 Wallet、Equity 与 Unrealized；已实现收益只统计当前实盘会话以来、交易所返回的已平仓 realized。"] : []),
     ...((state.tradingState?.adaptive?.notes || []).slice(0, 2))
   ];
@@ -1825,6 +1948,184 @@ function renderCandidates() {
   `;
 }
 
+function latestDecisionForLearning() {
+  const decisions = activeHistory().decisions || [];
+  return decisions.length ? decisions[decisions.length - 1] : null;
+}
+
+function latestInjectedLearningDecision() {
+  const decisions = (activeHistory().decisions || []).slice().reverse();
+  return decisions.find((decision) => decisionLearningLessons(decision).length || decisionPromptHasLearning(decision)) || null;
+}
+
+function decisionLearningLessons(decision) {
+  const output = decision?.output && typeof decision.output === "object" ? decision.output : {};
+  const lessons = output.historicalLessons || output.historical_lessons || [];
+  return Array.isArray(lessons) ? lessons : [];
+}
+
+function decisionPromptHasLearning(decision) {
+  return String(decision?.prompt || "").includes("# Historical Scene Lessons");
+}
+
+function sceneValueLabel(value) {
+  const labels = {
+    long: "做多",
+    short: "做空",
+    top3: "Top 3",
+    top10: "Top 10",
+    deep: "深池",
+    unknown: "未知",
+    down_strong: "强下行",
+    down: "下行",
+    flat: "震荡",
+    up: "上行",
+    up_strong: "强上行",
+    selloff: "急跌",
+    hot: "强动能",
+    near_high: "贴近高点",
+    shallow: "浅回撤",
+    normal: "常规回撤",
+    quiet: "低波动",
+    wide: "宽波动",
+    chaotic: "混乱高波动",
+    fading: "量能衰减",
+    steady: "量能稳定",
+    expanding: "量能扩张",
+    thin: "低流动性",
+    negative: "负费率",
+    neutral: "中性",
+    positive: "正费率"
+  };
+  return labels[String(value || "")] || String(value || "n/a");
+}
+
+function sceneChip(label, value) {
+  return `
+    <span class="learning-scene-chip">
+      <em>${escapeHtml(label)}</em>
+      <strong>${escapeHtml(sceneValueLabel(value))}</strong>
+    </span>
+  `;
+}
+
+function renderLearningScene(scene) {
+  const fields = [
+    ["方向", "side"],
+    ["候选排名", "rankBucket"],
+    ["趋势", "trendBucket"],
+    ["动能", "impulseBucket"],
+    ["回撤", "pullbackBucket"],
+    ["波动", "volatilityBucket"],
+    ["量能", "volumeBucket"],
+    ["流动性", "liquidityBucket"],
+    ["资金费", "fundingBucket"]
+  ];
+  const payload = scene && typeof scene === "object" ? scene : {};
+  return `
+    <div class="learning-scene-row">
+      ${fields.map(([label, key]) => sceneChip(label, payload[key])).join("")}
+    </div>
+  `;
+}
+
+function learningOutcomeTone(outcome) {
+  const text = String(outcome || "").toLowerCase();
+  if (text === "winner") return "positive";
+  if (text === "loser") return "danger";
+  return "neutral";
+}
+
+function renderLearningLessonCard(lesson, index, injected) {
+  const outcome = String(lesson?.outcome || "unknown").toLowerCase();
+  const sourceDecision = lesson?.sourceDecisionId || "n/a";
+  const sourceSymbol = lesson?.sourceSymbol || "n/a";
+  const matchedSymbol = lesson?.matchedCurrentSymbol || "n/a";
+  const score = Number(lesson?.similarityScore);
+  const horizon = Number(lesson?.horizonHours);
+  return `
+    <article class="learning-lesson-card">
+      <div class="decision-output-card-head">
+        <strong>#${escapeHtml(String(index + 1))} ${escapeHtml(sourceSymbol)}</strong>
+        <div class="decision-output-badges">
+          ${decisionBadge(outcome.toUpperCase(), learningOutcomeTone(outcome))}
+          ${decisionBadge(injected ? "已注入" : "未注入", injected ? "positive" : "warning")}
+        </div>
+      </div>
+      <div class="learning-link-grid">
+        ${decisionMetric("来源决策", sourceDecision)}
+        ${decisionMetric("匹配当前", matchedSymbol)}
+        ${decisionMetric("相似度", Number.isFinite(score) ? fmtNumber(score, 2) : "n/a")}
+        ${decisionMetric("回看窗口", Number.isFinite(horizon) && horizon > 0 ? `${horizon}h` : "n/a")}
+        ${decisionMetric("终值", fmtPct(lesson?.terminalPct))}
+        ${decisionMetric("最好", fmtPct(lesson?.maxFavorablePct))}
+        ${decisionMetric("最差", fmtPct(lesson?.maxAdversePct))}
+      </div>
+      ${renderLearningScene(lesson?.scene)}
+      <p class="decision-output-reason">${escapeHtml(lesson?.lesson || "没有学习摘要。")}</p>
+    </article>
+  `;
+}
+
+function renderLearning() {
+  if (!els.learningMeta || !els.learningPanel) return;
+  const enabled = state.tradingSettings?.selfLearning?.enabled === true;
+  const latestDecision = latestDecisionForLearning();
+  const latestLessons = decisionLearningLessons(latestDecision);
+  const injected = latestLessons.length > 0 && decisionPromptHasLearning(latestDecision);
+  const recentInjectedDecision = latestInjectedLearningDecision();
+  const latestId = latestDecision?.id || "n/a";
+  const latestAt = latestDecision?.finishedAt || latestDecision?.startedAt;
+  els.learningMeta.textContent = [
+    enabled ? "已启用" : "未启用",
+    `最新决策 ${latestId}`,
+    `Top lessons ${latestLessons.length}`,
+    injected ? "已注入本轮 Prompt" : "本轮未注入"
+  ].join(" · ");
+
+  const overview = `
+    <div class="learning-overview-grid">
+      ${decisionMetric("实例开关", enabled ? "ON" : "OFF", enabled ? "is-positive" : "")}
+      ${decisionMetric("最新决策", latestId)}
+      ${decisionMetric("决策时间", fmtDateTime(latestAt))}
+      ${decisionMetric("注入状态", injected ? "已注入" : "未注入", injected ? "is-positive" : "")}
+      ${decisionMetric("经验条数", String(latestLessons.length))}
+    </div>
+  `;
+
+  if (!enabled) {
+    els.learningPanel.innerHTML = `
+      ${overview}
+      <p class="empty">当前实例没有启用自学习经验注入。勾选运行设置里的开关并保存后，下一轮决策才会把相似历史经验注入 Prompt。</p>
+    `;
+    return;
+  }
+  if (!latestDecision) {
+    els.learningPanel.innerHTML = `
+      ${overview}
+      <p class="empty">还没有决策记录。等第一轮决策完成后，这里会显示本轮学习经验。</p>
+    `;
+    return;
+  }
+  if (!latestLessons.length) {
+    const recentNote = recentInjectedDecision && recentInjectedDecision.id !== latestDecision.id
+      ? `<p class="meta">最近一次有学习注入的决策是 ${escapeHtml(recentInjectedDecision.id)}，时间 ${escapeHtml(fmtDateTime(recentInjectedDecision.finishedAt || recentInjectedDecision.startedAt))}。</p>`
+      : "";
+    els.learningPanel.innerHTML = `
+      ${overview}
+      <p class="empty">最新一轮没有可展示的学习经验。可能是这轮运行在开关打开前，或当前场景没有匹配到足够相似的历史开仓样本。</p>
+      ${recentNote}
+    `;
+    return;
+  }
+  els.learningPanel.innerHTML = `
+    ${overview}
+    <div class="learning-lesson-list">
+      ${latestLessons.map((lesson, index) => renderLearningLessonCard(lesson, index, injected)).join("")}
+    </div>
+  `;
+}
+
 function normalizeDecisionOutputPayload(output) {
   const payload = output && typeof output === "object" ? output : {};
   return {
@@ -1887,6 +2188,9 @@ function renderPositionActionCard(action) {
   if (Number.isFinite(Number(action?.takeProfit))) {
     metrics.push(decisionMetric("止盈", fmtPrice(action.takeProfit)));
   }
+  if (Number.isFinite(Number(action?.takeProfitFraction)) && Number(action.takeProfitFraction) > 0 && Number(action.takeProfitFraction) < 0.999) {
+    metrics.push(decisionMetric("止盈仓位", fmtPct(Number(action.takeProfitFraction) * 100, 0)));
+  }
   return `
     <article class="decision-output-card">
       <div class="decision-output-card-head">
@@ -1915,6 +2219,9 @@ function renderEntryActionCard(action) {
   }
   if (Number.isFinite(Number(action?.takeProfit))) {
     metrics.push(decisionMetric("止盈", fmtPrice(action.takeProfit)));
+  }
+  if (Number.isFinite(Number(action?.takeProfitFraction)) && Number(action.takeProfitFraction) > 0 && Number(action.takeProfitFraction) < 0.999) {
+    metrics.push(decisionMetric("止盈仓位", fmtPct(Number(action.takeProfitFraction) * 100, 0)));
   }
   return `
     <article class="decision-output-card">
@@ -2205,11 +2512,12 @@ function renderUniverseTest() {
 function renderLogs() {
   const entries = state.logs?.entries || [];
   const clientErrors = state.clientErrors || [];
-  const paperRunner = state.tradingState?.paperRunner || {};
-  const liveRunner = state.tradingState?.liveRunner || {};
+  const tradeRunner = state.tradingState?.tradeRunner || {};
   const scanRunner = state.tradingState?.scanRunner || {};
-  const latestError = paperRunner.lastError || liveRunner.lastError || scanRunner.lastError || "无";
+  const latestError = tradeRunner.lastError || scanRunner.lastError || "无";
   const sessionStartedAt = state.logs?.sessionStartedAt ? fmtDateTime(state.logs.sessionStartedAt) : "n/a";
+  const mode = currentViewMode();
+  const enabled = currentRunnerEnabled();
   els.logMeta.textContent = clientErrors.length
     ? `最近 ${entries.length} 条系统输出，另有 ${clientErrors.length} 条前端错误`
     : (entries.length ? `最近 ${entries.length} 条系统输出` : "暂时还没有日志输出");
@@ -2220,14 +2528,9 @@ function renderLogs() {
       <p class="subtle">重启服务后，这里的系统日志会从新的启动时间开始</p>
     </article>
     <article class="log-pill">
-      <span>模拟盘</span>
-      <strong>${escapeHtml(paperRunner.running ? "执行中" : (state.tradingState?.paperTradingEnabled ? "已启动" : "已暂停"))}</strong>
-      <p class="subtle">下次调度 ${escapeHtml(fmtDateTime(state.tradingState?.paperNextDecisionDueAt))}</p>
-    </article>
-    <article class="log-pill">
-      <span>实盘</span>
-      <strong>${escapeHtml(liveRunner.running ? "执行中" : (state.tradingState?.liveTradingEnabled ? "已启动" : "已暂停"))}</strong>
-      <p class="subtle">下次调度 ${escapeHtml(fmtDateTime(state.tradingState?.liveNextDecisionDueAt))}</p>
+      <span>${escapeHtml(modeName(mode))}</span>
+      <strong>${escapeHtml(tradeRunner.running ? "执行中" : (enabled ? "已启动" : "已暂停"))}</strong>
+      <p class="subtle">下次调度 ${escapeHtml(fmtDateTime(state.tradingState?.nextDecisionDueAt))}</p>
     </article>
     <article class="log-pill">
       <span>候选池刷新</span>
@@ -2253,6 +2556,7 @@ function renderAll() {
   renderPositions();
   renderClosedPositions();
   renderCandidates();
+  renderLearning();
   renderDecisionLog();
   renderPromptTest();
   renderPromptLibrary();
@@ -2263,11 +2567,15 @@ function renderAll() {
 
 function scheduleRefresh() {
   if (state.autoRefreshTimer) window.clearTimeout(state.autoRefreshTimer);
-  const delayMs = (state.settings?.pageAutoRefreshSeconds || 600) * 1000;
+  const delayMs = (state.settings?.pageAutoRefreshSeconds || 30) * 1000;
   state.autoRefreshTimer = window.setTimeout(loadData, delayMs);
 }
 
 async function loadData() {
+  if (!INSTANCE_ID) {
+    window.location.replace("/");
+    return;
+  }
   els.toggleModeBtn.disabled = true;
   els.modeRunnerBtn.disabled = true;
   try {
@@ -2289,6 +2597,8 @@ async function loadData() {
     state.scan = scan;
     state.settings = settings;
     state.tradingState = tradingState;
+    state.instance = tradingState.instance || state.instance;
+    state.viewMode = state.instance?.type === "live" ? "live" : "paper";
     state.tradingSettings = tradingSettings;
     state.provider = provider;
     state.prompt = prompt;
@@ -2370,9 +2680,32 @@ async function handleRunScan() {
 }
 
 function handleToggleMode() {
-  state.viewMode = currentViewMode() === "live" ? "paper" : "live";
-  writeStoredValue(MODE_STORAGE_KEY, state.viewMode);
-  renderAll();
+  window.location.href = "/";
+}
+
+async function handleCloneLive() {
+  if (!INSTANCE_ID || state.instance?.type !== "paper") return;
+  if (els.cloneLiveBtn) {
+    els.cloneLiveBtn.disabled = true;
+    els.cloneLiveBtn.textContent = "克隆中";
+  }
+  try {
+    const result = await postJson(`${INSTANCE_API_BASE}/clone-live`, {});
+    const nextInstanceId = result?.instance?.id;
+    const nextInstanceName = result?.instance?.name || "新实盘";
+    els.settingsFeedback.textContent = `已创建实盘实例：${nextInstanceName}，默认保持暂停。`;
+    if (nextInstanceId) {
+      window.location.href = `/trader.html?instance=${encodeURIComponent(nextInstanceId)}`;
+      return;
+    }
+  } catch (error) {
+    els.settingsFeedback.textContent = `克隆实盘失败：${error.message}`;
+  } finally {
+    if (els.cloneLiveBtn) {
+      els.cloneLiveBtn.disabled = false;
+      els.cloneLiveBtn.textContent = "克隆为实盘";
+    }
+  }
 }
 
 async function handleToggleRunner() {
@@ -2455,10 +2788,13 @@ async function handleSaveTradingSettings(event) {
     riskPerTradePct: Number(els.riskPerTradeInput.value || 2.5),
     minConfidence: Number(els.minConfidenceInput.value || 60),
     paperFeesBps: Number(els.paperFeesInput.value || 4),
-    allowShorts: els.allowShortsInput.checked
+    allowShorts: els.allowShortsInput.checked,
+    selfLearning: {
+      enabled: els.selfLearningEnabledInput.checked
+    }
   };
   const dashboardPayload = {
-    pageAutoRefreshSeconds: Number(els.pageAutoRefreshInput.value || 600)
+    pageAutoRefreshSeconds: Number(els.pageAutoRefreshInput.value || 60)
   };
   if (els.saveTradingSettingsBtn) els.saveTradingSettingsBtn.disabled = true;
   els.settingsFeedback.textContent = "正在保存运行设置…";
@@ -2477,12 +2813,17 @@ async function handleSaveTradingSettings(event) {
     }
     state.tradingSettings = tradingSettings;
     state.settings = dashboardSettings;
-    const writeMatch = tradingSettingsMatch(tradingPayload, tradingSettings, dashboardPayload, dashboardSettings);
+    const writeDiffs = tradingSettingsDiffs(tradingPayload, tradingSettings, dashboardPayload, dashboardSettings);
     await loadData();
-    const reloadMatch = tradingSettingsMatch(tradingPayload, state.tradingSettings, dashboardPayload, state.settings);
-    els.settingsFeedback.textContent = (writeMatch && reloadMatch)
+    const reloadDiffs = tradingSettingsDiffs(tradingPayload, state.tradingSettings, dashboardPayload, state.settings);
+    els.settingsFeedback.textContent = (!writeDiffs.length && !reloadDiffs.length)
       ? (exchangeChanged ? "运行设置已保存并校验成功，已按新交易所刷新候选池。" : "运行设置已保存并校验成功。")
-      : tradingSettingsMismatchMessage(state.tradingSettings, state.settings);
+      : tradingSettingsMismatchMessage(
+        tradingPayload,
+        state.tradingSettings,
+        dashboardPayload,
+        state.settings
+      );
     if (exchangeChanged) {
       window.setTimeout(loadData, 1200);
     }
@@ -2584,6 +2925,9 @@ async function handleSavePromptPreset() {
     return;
   }
   const linkedPreset = currentPromptPreset();
+  if (!linkedPreset && state.promptEditingPresetId) {
+    payload.presetId = null;
+  }
   if (linkedPreset && String(payload.name).trim() !== String(linkedPreset.name || "").trim()) {
     payload.presetId = null;
   }
@@ -2591,6 +2935,12 @@ async function handleSavePromptPreset() {
   els.promptFeedback.textContent = "正在保存到已保存 Prompt…";
   try {
     const result = await postJson("/api/trading/prompt-library/save", payload);
+    const appliedPayload = {
+      ...payload,
+      name: result.preset?.name || payload.name,
+      presetId: result.preset?.id || null,
+    };
+    state.prompt = await postJson("/api/trading/prompt", appliedPayload);
     state.promptLibrary = {
       ...(state.promptLibrary || {}),
       prompts: result.prompts || [],
@@ -2599,8 +2949,9 @@ async function handleSavePromptPreset() {
     if (result.preset?.name) {
       els.promptNameInput.value = result.preset.name;
     }
+    renderPromptPresetMeta();
     renderPromptLibrary();
-    els.promptFeedback.textContent = `已保存 Prompt：${result.preset?.name || payload.name}`;
+    els.promptFeedback.textContent = `已保存并设为当前使用：${result.preset?.name || payload.name}`;
   } catch (error) {
     els.promptFeedback.textContent = `保存失败：${error.message}`;
   } finally {
@@ -2922,6 +3273,7 @@ async function handleSaveLiveConfig(event) {
 
 els.themeToggleBtn.addEventListener("click", handleThemeToggle);
 els.toggleModeBtn.addEventListener("click", handleToggleMode);
+els.cloneLiveBtn.addEventListener("click", handleCloneLive);
 els.modeRunnerBtn.addEventListener("click", handleToggleRunner);
 els.flattenBtn.addEventListener("click", handleFlatten);
 els.resetBtn.addEventListener("click", handleReset);

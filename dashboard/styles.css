@@ -1769,6 +1769,10 @@ a:hover {
   grid-column: 1 / -1;
 }
 
+.compact-settings-form .settings-full-row {
+  grid-column: 1 / -1;
+}
+
 .prompt-test-block {
   display: grid;
   gap: 10px;
@@ -2658,6 +2662,69 @@ html[data-theme="light"] .short-tag {
 .decision-output-metric strong {
   color: var(--text);
   font-size: 0.9rem;
+  word-break: break-word;
+}
+
+.decision-output-metric.is-positive strong {
+  color: var(--green);
+}
+
+.learning-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.learning-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.learning-lesson-list {
+  display: grid;
+  gap: 12px;
+}
+
+.learning-lesson-card {
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.learning-link-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.learning-scene-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.learning-scene-chip {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  background: var(--row-bg);
+}
+
+.learning-scene-chip em {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-style: normal;
+}
+
+.learning-scene-chip strong {
+  color: var(--text);
+  font-size: 0.78rem;
 }
 
 .decision-raw-json summary {
@@ -2756,6 +2823,28 @@ html[data-theme="light"] .short-tag {
 .account-panel-grid {
   display: grid;
   gap: 14px;
+}
+
+.exchange-cooldown-banner,
+.instance-cooldown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--yellow) 62%, var(--line) 38%);
+  background: color-mix(in srgb, var(--yellow) 12%, var(--panel) 88%);
+  color: var(--text);
+}
+
+.exchange-cooldown-banner strong,
+.instance-cooldown strong {
+  color: var(--yellow);
+}
+
+.exchange-cooldown-banner span,
+.instance-cooldown span {
+  color: var(--muted);
 }
 
 .account-chart-grid {
@@ -3255,6 +3344,295 @@ html[data-theme="light"] .short-tag {
   .detail-metric-grid,
   .drawer-detector,
   .drawer-links {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workbench-shell {
+  max-width: 1840px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+}
+
+.workbench-topbar {
+  min-height: 60px;
+  padding: 8px 22px;
+}
+
+.workbench-brand {
+  display: grid;
+  gap: 2px;
+  align-content: center;
+}
+
+.workbench-logo {
+  width: min(220px, 100%);
+  height: auto;
+}
+
+.workbench-header-actions {
+  align-self: center;
+}
+
+.workbench-brand .meta {
+  min-height: 0;
+  margin: 0;
+  line-height: 1;
+}
+
+.workbench-actions-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.workbench-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.workbench-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 10px;
+}
+
+.workbench-summary-card,
+.instance-card {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: var(--soft-shadow);
+}
+
+.workbench-summary-card {
+  padding: 12px 16px;
+  display: grid;
+  gap: 4px;
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.workbench-summary-card:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+}
+
+.workbench-summary-card span {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workbench-summary-card strong {
+  font-size: 24px;
+}
+
+.workbench-summary-card.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--panel) 82%, var(--accent) 18%);
+}
+
+.workbench-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(520px, 560px));
+  justify-content: start;
+  gap: 20px;
+}
+
+.instance-card {
+  min-height: 408px;
+  padding: 22px;
+  display: grid;
+  gap: 18px;
+}
+
+.instance-card-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.instance-status-indicator {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  margin-top: 4px;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--line);
+}
+
+.instance-status-indicator.is-running {
+  background: #16c47f;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px rgba(22, 196, 127, 0.28), 0 0 18px rgba(22, 196, 127, 0.45);
+}
+
+.instance-status-indicator.is-stopped {
+  background: #ef4444;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px rgba(239, 68, 68, 0.24), 0 0 14px rgba(239, 68, 68, 0.32);
+}
+
+.instance-card-top h2 {
+  margin: 4px 0 6px;
+  font-size: 26px;
+}
+
+.instance-type {
+  margin: 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.instance-card-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: auto;
+}
+
+.instance-card-actions button {
+  width: 100%;
+}
+
+.instance-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+}
+
+.instance-stats-grid span {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--line);
+}
+
+.instance-chart-block {
+  display: grid;
+  gap: 12px;
+  padding: 16px 16px 14px;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+
+.instance-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.instance-chart-head strong {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.instance-sparkline {
+  width: 100%;
+  height: 156px;
+  display: block;
+}
+
+.instance-sparkline-fill {
+  fill: color-mix(in srgb, var(--orange) 16%, transparent);
+}
+
+.instance-sparkline-line {
+  fill: none;
+  stroke: var(--orange);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.instance-sparkline-dot {
+  stroke: var(--panel-soft);
+  stroke-width: 2;
+  fill: var(--orange);
+}
+
+.instance-sparkline-dot.is-end {
+  fill: color-mix(in srgb, var(--orange) 72%, white 28%);
+}
+
+.instance-sparkline-empty {
+  min-height: 156px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+}
+
+.instance-warning {
+  margin: 0;
+  color: var(--yellow);
+}
+
+.instance-cooldown {
+  margin: 0;
+  font-size: 0.86rem;
+}
+
+@media (max-width: 1320px) {
+  .workbench-grid {
+    grid-template-columns: repeat(auto-fit, minmax(460px, 520px));
+  }
+}
+
+@media (max-width: 1080px) {
+  .workbench-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 840px) {
+  .workbench-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .instance-card-top {
+    flex-direction: column;
+  }
+
+  .instance-card-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workbench-actions-row {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .workbench-shell {
+    padding: 18px 16px 32px;
+  }
+
+  .workbench-logo {
+    width: min(220px, 100%);
+  }
+
+  .workbench-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .workbench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .instance-card-actions {
     grid-template-columns: 1fr;
   }
 }

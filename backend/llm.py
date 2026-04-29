@@ -8,6 +8,21 @@ from .http_client import HttpRequestError, request_json
 from .utils import parse_json_loose
 
 
+class ModelDecisionParseError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str,
+        raw_response: dict[str, Any] | None,
+        provider_result: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.raw_response = raw_response or {}
+        self.provider_result = provider_result
+
+
 def provider_issues(provider: dict[str, Any] | None = None) -> list[str]:
     provider = provider or read_llm_provider()
     issues = []
@@ -30,6 +45,7 @@ def provider_status(provider: dict[str, Any] | None = None) -> dict[str, Any]:
         "apiStyle": provider.get("apiStyle"),
         "model": provider.get("model"),
         "baseUrl": provider.get("baseUrl"),
+        "bypassProxy": provider.get("bypassProxy") is True,
         "configured": not issues,
         "issues": issues,
     }
@@ -67,6 +83,23 @@ def _gateway_hint(provider: dict[str, Any], request_url: str) -> str | None:
     return None
 
 
+def _transport_error_hint(request_url: str, error: Exception, network_settings: dict[str, Any]) -> str | None:
+    text = str(error)
+    if "UNEXPECTED_EOF_WHILE_READING" not in text and "EOF occurred in violation of protocol" not in text:
+        return None
+    host = str(urlparse(request_url).hostname or "").lower()
+    if host == "api.moonshot.ai":
+        if network_settings.get("proxyEnabled") and network_settings.get("proxyUrl"):
+            return (
+                "这更像是 TLS/代理握手失败，不是 API key 错误。当前项目代理已开启，"
+                "请优先尝试关闭代理后重试，或把 api.moonshot.ai 加到“不走代理的地址”。"
+            )
+        return "这更像是 TLS 握手失败，不是 API key 错误。请检查当前网络、VPN 或本机代理。"
+    if network_settings.get("proxyEnabled") and network_settings.get("proxyUrl"):
+        return "这更像是 TLS/代理握手失败。请优先尝试关闭代理后重试，或把当前域名加入“不走代理的地址”。"
+    return "这更像是 TLS 握手失败。请检查当前网络、VPN 或本机代理。"
+
+
 def _provider_transport_candidates(provider: dict[str, Any]) -> list[str]:
     configured = str(provider.get("apiStyle") or "").strip().lower()
     candidates: list[str] = []
@@ -83,6 +116,14 @@ def _provider_transport_candidates(provider: dict[str, Any]) -> list[str]:
     return candidates
 
 
+def _is_deepseek_openai_provider(provider: dict[str, Any], request_api_style: str) -> bool:
+    if str(request_api_style or "").strip().lower() != "openai":
+        return False
+    preset = str(provider.get("preset") or "").strip().lower()
+    host = str(urlparse(str(provider.get("baseUrl") or "")).hostname or "").lower()
+    return preset == "deepseek" or host == "api.deepseek.com"
+
+
 def _persist_provider_api_style(provider: dict[str, Any], resolved_api_style: str) -> dict[str, Any] | None:
     current_style = str(provider.get("apiStyle") or "").strip().lower()
     if resolved_api_style == current_style:
@@ -97,10 +138,18 @@ def _persist_provider_api_style(provider: dict[str, Any], resolved_api_style: st
             "timeoutSeconds": provider.get("timeoutSeconds"),
             "temperature": provider.get("temperature"),
             "maxOutputTokens": provider.get("maxOutputTokens"),
+            "bypassProxy": provider.get("bypassProxy") is True,
             "anthropicVersion": provider.get("anthropicVersion"),
             "customHeaders": provider.get("customHeaders") if isinstance(provider.get("customHeaders"), dict) else {},
         }
     )
+
+
+def _provider_network_settings(provider: dict[str, Any], network_settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved = dict(network_settings or {})
+    if provider.get("bypassProxy") is True:
+        resolved["proxyEnabled"] = False
+    return resolved
 
 
 def _openai_messages(prompt_text: str) -> list[dict[str, str]]:
@@ -201,6 +250,9 @@ def _request_provider_text(
             hint = _gateway_hint({**provider, "apiStyle": request_api_style}, url)
             if hint:
                 raise HttpRequestError(f"{error} | {hint}") from error
+            transport_hint = _transport_error_hint(url, error, network_settings)
+            if transport_hint:
+                raise HttpRequestError(f"{error} | {transport_hint} | 当前请求地址：{url}") from error
             raise
         raw_text = _extract_anthropic_text(raw_response)
     else:
@@ -217,6 +269,8 @@ def _request_provider_text(
             "temperature": provider["temperature"],
             "max_tokens": provider["maxOutputTokens"],
         }
+        if _is_deepseek_openai_provider(provider, request_api_style):
+            payload["response_format"] = {"type": "json_object"}
         try:
             raw_response = request_json(
                 "POST",
@@ -227,6 +281,9 @@ def _request_provider_text(
                 network_settings=network_settings,
             )
         except HttpRequestError as error:
+            transport_hint = _transport_error_hint(url, error, network_settings)
+            if transport_hint:
+                raise HttpRequestError(f"{error} | {transport_hint} | 当前请求地址：{url}") from error
             raise HttpRequestError(f"{error} | 当前请求地址：{url}") from error
         raw_text = _extract_openai_text(raw_response)
     return {
@@ -238,19 +295,23 @@ def _request_provider_text(
     }
 
 
-def generate_trading_decision(prompt_text: str, provider: dict[str, Any] | None = None) -> dict[str, Any]:
+def generate_trading_decision(
+    prompt_text: str,
+    provider: dict[str, Any] | None = None,
+    network_settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     provider = provider or read_llm_provider()
     issues = provider_issues(provider)
     if issues:
         raise ValueError(" ".join(issues))
     configured_api_style = str(provider.get("apiStyle") or "").strip().lower()
-    network_settings = read_network_settings()
+    effective_network_settings = _provider_network_settings(provider, network_settings or read_network_settings())
     attempts: list[str] = []
     last_error: Exception | None = None
     selected_result: dict[str, Any] | None = None
     for request_api_style in _provider_transport_candidates(provider):
         try:
-            selected_result = _request_provider_text(prompt_text, provider, request_api_style, network_settings)
+            selected_result = _request_provider_text(prompt_text, provider, request_api_style, effective_network_settings)
             break
         except (HttpRequestError, ValueError) as error:
             last_error = error
@@ -263,8 +324,36 @@ def generate_trading_decision(prompt_text: str, provider: dict[str, Any] | None 
             raise last_error
         raise HttpRequestError("模型请求失败，未获得可用响应。")
     resolved_api_style = selected_result["resolvedApiStyle"]
+    parse_attempt = 0
+    while True:
+        parse_attempt += 1
+        try:
+            parsed = parse_json_loose(selected_result["rawText"])
+            break
+        except Exception as error:
+            should_retry = parse_attempt == 1 and _is_deepseek_openai_provider(provider, resolved_api_style)
+            if should_retry:
+                selected_result = _request_provider_text(prompt_text, provider, resolved_api_style, effective_network_settings)
+                continue
+            saved_provider = _persist_provider_api_style(provider, resolved_api_style)
+            raise ModelDecisionParseError(
+                str(error),
+                raw_text=selected_result["rawText"],
+                raw_response=selected_result["rawResponse"] if isinstance(selected_result.get("rawResponse"), dict) else {},
+                provider_result={
+                    "preset": provider.get("preset"),
+                    "apiStyle": configured_api_style,
+                    "resolvedApiStyle": resolved_api_style,
+                    "model": provider.get("model"),
+                    "baseUrl": provider.get("baseUrl"),
+                    "bypassProxy": provider.get("bypassProxy") is True,
+                    "resolvedBaseUrl": selected_result["resolvedBaseUrl"],
+                    "requestUrl": selected_result["requestUrl"],
+                    "autoConfigured": resolved_api_style != configured_api_style,
+                    "autoConfiguredSaved": saved_provider is not None,
+                },
+            ) from error
     saved_provider = _persist_provider_api_style(provider, resolved_api_style)
-    parsed = parse_json_loose(selected_result["rawText"])
     return {
         "provider": {
             "preset": provider.get("preset"),
@@ -272,6 +361,7 @@ def generate_trading_decision(prompt_text: str, provider: dict[str, Any] | None 
             "resolvedApiStyle": resolved_api_style,
             "model": provider.get("model"),
             "baseUrl": provider.get("baseUrl"),
+            "bypassProxy": provider.get("bypassProxy") is True,
             "resolvedBaseUrl": selected_result["resolvedBaseUrl"],
             "requestUrl": selected_result["requestUrl"],
             "autoConfigured": resolved_api_style != configured_api_style,

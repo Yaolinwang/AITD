@@ -9,6 +9,7 @@
   "timeoutSeconds": 45,
   "temperature": 0.2,
   "maxOutputTokens": 1200,
+  "bypassProxy": false,
   "anthropicVersion": "2023-06-01",
   "customHeaders": {}
 }

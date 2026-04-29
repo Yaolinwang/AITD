@@ -14,7 +14,16 @@ CACHE_DIR = DATA_DIR / "cache" / "http"
 
 
 class HttpRequestError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def _cache_path(namespace: str, url: str) -> Path:
@@ -57,8 +66,15 @@ def _build_opener(url: str, network_settings: dict[str, Any] | None):
     if not network_settings:
         return build_opener()
     parsed = urlparse(url)
-    if not network_settings.get("proxyEnabled") or not network_settings.get("proxyUrl") or _should_bypass_proxy(parsed.hostname or "", network_settings):
-        return build_opener()
+    if (
+        not network_settings.get("proxyEnabled")
+        or not network_settings.get("proxyUrl")
+        or _should_bypass_proxy(parsed.hostname or "", network_settings)
+    ):
+        # Explicitly install an empty ProxyHandler so urllib does not silently
+        # fall back to HTTP(S)_PROXY environment variables when this request
+        # is configured to bypass the local proxy.
+        return build_opener(ProxyHandler({}))
     proxy_url = str(network_settings.get("proxyUrl") or "").strip()
     scheme = parsed.scheme.lower()
     proxies = {
@@ -104,7 +120,12 @@ def request_text(
             return response.read().decode("utf-8")
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise HttpRequestError(f"{error.code} {error.reason}: {detail}") from error
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        raise HttpRequestError(
+            f"{error.code} {error.reason}: {detail}",
+            status_code=error.code,
+            retry_after=retry_after,
+        ) from error
     except URLError as error:
         raise HttpRequestError(str(error.reason)) from error
 
@@ -147,11 +168,17 @@ def cached_get_json(
     timeout_seconds: int = 45,
     headers: dict[str, str] | None = None,
     network_settings: dict[str, Any] | None = None,
+    prefer_cache: bool = False,
+    allow_network: bool = True,
 ) -> Any:
     path = _cache_path(namespace, url)
     cache = read_json(path, {})
     if _cache_is_fresh(cache):
         return cache.get("payload")
+    if prefer_cache and _cache_is_usable(cache):
+        return cache.get("payload")
+    if not allow_network:
+        raise HttpRequestError("cached response unavailable while exchange API cooldown is active")
     try:
         payload = request_json(
             "GET",

@@ -25,6 +25,12 @@
   "liveTrading": {
     "enabled": false
   },
+  "selfLearning": {
+    "enabled": false,
+    "maxLessons": 5,
+    "lookbackDecisions": 300,
+    "reviewHorizonHours": 4
+  },
   "liveExecution": {
     "configPath": "config/live_trading.json",
     "useExchangeProtectionOrders": true,

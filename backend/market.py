@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import PROMPT_KLINE_FEED_OPTIONS, read_candidate_source_code, read_fixed_universe, read_network_settings, read_trading_settings
+from .instances import instance_paths
 from .exchanges.catalog import DEFAULT_EXCHANGE_ID, normalize_exchange_id
 from .exchanges import get_active_exchange_gateway
-from .utils import CONFIG_DIR, DATA_DIR, ROOT, clamp, current_run_date, now_iso, num, read_json, write_json
+from .utils import CONFIG_DIR, DATA_DIR, ROOT, clamp, current_run_date, now_iso, num, read_json, sha1_hex, write_json
 
 
 LEGACY_LATEST_SCAN_PATH = DATA_DIR / "scans" / "latest.json"
+SHARED_SCAN_ARCHIVE_ROOT = DATA_DIR / "scan-archive"
 SCAN_BUCKET_LIMITS = {
     "research": 70,
     "watch": 55,
@@ -21,21 +23,131 @@ SCAN_BUCKET_LIMITS = {
 }
 
 
-def _latest_scan_path(exchange_id: str | None = None) -> Path:
+def _latest_scan_path(exchange_id: str | None = None, instance_id: str | None = None) -> Path:
     if exchange_id is None:
-        settings = read_trading_settings()
+        settings = read_trading_settings(instance_id)
         exchange_id = settings.get("activeExchange")
     normalized = normalize_exchange_id(exchange_id, capability="market")
+    if instance_id:
+        return instance_paths(instance_id)["scans_dir"] / normalized / "latest.json"
     return DATA_DIR / "scans" / normalized / "latest.json"
 
 
-def read_latest_scan(exchange_id: str | None = None) -> dict[str, Any]:
+def _scan_archive_dir(exchange_id: str | None = None, instance_id: str | None = None, run_date: str | None = None) -> Path:
     if exchange_id is None:
-        settings = read_trading_settings()
+        settings = read_trading_settings(instance_id)
         exchange_id = settings.get("activeExchange")
     normalized = normalize_exchange_id(exchange_id, capability="market")
-    payload = read_json(_latest_scan_path(normalized), None)
-    if not isinstance(payload, dict) and normalized == DEFAULT_EXCHANGE_ID:
+    bucket = str(run_date or current_run_date()).strip() or current_run_date()
+    if instance_id:
+        return instance_paths(instance_id)["scans_dir"] / normalized / "archive" / bucket
+    return DATA_DIR / "scans" / normalized / "archive" / bucket
+
+
+def _scan_archive_refs_dir(exchange_id: str | None = None, instance_id: str | None = None, run_date: str | None = None) -> Path:
+    if exchange_id is None:
+        settings = read_trading_settings(instance_id)
+        exchange_id = settings.get("activeExchange")
+    normalized = normalize_exchange_id(exchange_id, capability="market")
+    bucket = str(run_date or current_run_date()).strip() or current_run_date()
+    if instance_id:
+        return instance_paths(instance_id)["scans_dir"] / normalized / "archive_refs" / bucket
+    return DATA_DIR / "scans" / normalized / "archive_refs" / bucket
+
+
+def _scan_archive_path(payload: dict[str, Any], exchange_id: str | None = None, instance_id: str | None = None) -> Path:
+    run_date = str(payload.get("runDate") or current_run_date()).strip() or current_run_date()
+    fetched_at = str(payload.get("fetchedAt") or now_iso()).strip() or now_iso()
+    safe_timestamp = (
+        fetched_at.replace("-", "")
+        .replace(":", "")
+        .replace(".", "")
+        .replace("+", "")
+        .replace("Z", "Z")
+    )
+    scan_id = str(payload.get("scanId") or f"scan-{int(time.time() * 1000)}").strip()
+    return _scan_archive_dir(exchange_id, instance_id, run_date) / f"{safe_timestamp}-{scan_id}.json"
+
+
+def _shared_scan_archive_dir(exchange_id: str | None = None, run_date: str | None = None) -> Path:
+    normalized = normalize_exchange_id(exchange_id, capability="market")
+    bucket = str(run_date or current_run_date()).strip() or current_run_date()
+    return SHARED_SCAN_ARCHIVE_ROOT / normalized / bucket
+
+
+def _scan_archive_fingerprint(payload: dict[str, Any], exchange_id: str | None = None) -> str:
+    normalized_payload = {
+        "version": int(payload.get("version") or 1),
+        "runDate": payload.get("runDate"),
+        "fetchedAt": payload.get("fetchedAt"),
+        "source": payload.get("source"),
+        "exchange": normalize_exchange_id(exchange_id or payload.get("exchange"), capability="market"),
+        "universeSize": int(payload.get("universeSize") or 0),
+        "skippedSymbols": payload.get("skippedSymbols") if isinstance(payload.get("skippedSymbols"), list) else [],
+        "candidateSource": payload.get("candidateSource") if isinstance(payload.get("candidateSource"), dict) else {},
+        "opportunities": payload.get("opportunities") if isinstance(payload.get("opportunities"), list) else [],
+    }
+    return sha1_hex(__import__("json").dumps(normalized_payload, ensure_ascii=False, sort_keys=True))
+
+
+def _shared_scan_archive_path(payload: dict[str, Any], exchange_id: str | None = None) -> Path:
+    run_date = str(payload.get("runDate") or current_run_date()).strip() or current_run_date()
+    fetched_at = str(payload.get("fetchedAt") or now_iso()).strip() or now_iso()
+    safe_timestamp = (
+        fetched_at.replace("-", "")
+        .replace(":", "")
+        .replace(".", "")
+        .replace("+", "")
+        .replace("Z", "Z")
+    )
+    fingerprint = _scan_archive_fingerprint(payload, exchange_id)
+    return _shared_scan_archive_dir(exchange_id or payload.get("exchange"), run_date) / f"{safe_timestamp}-{fingerprint[:12]}.json"
+
+
+def archive_scan(payload: dict[str, Any], exchange_id: str | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    shared_path = _shared_scan_archive_path(payload, exchange_id)
+    shared_created = not shared_path.exists()
+    if shared_created:
+        shared_payload = {
+            **payload,
+            "archiveFingerprint": _scan_archive_fingerprint(payload, exchange_id),
+        }
+        write_json(shared_path, shared_payload)
+    if not instance_id:
+        return {
+            "sharedPath": shared_path,
+            "refPath": None,
+            "sharedCreated": shared_created,
+        }
+    ref_payload = {
+        "version": 1,
+        "instanceId": instance_id,
+        "exchange": normalize_exchange_id(exchange_id or payload.get("exchange"), capability="market"),
+        "runDate": payload.get("runDate"),
+        "fetchedAt": payload.get("fetchedAt"),
+        "scanId": payload.get("scanId"),
+        "sharedPath": str(shared_path.relative_to(ROOT)),
+        "sharedFingerprint": _scan_archive_fingerprint(payload, exchange_id),
+        "source": payload.get("source"),
+        "universeSize": int(payload.get("universeSize") or 0),
+        "opportunityCount": len(payload.get("opportunities") or []),
+    }
+    ref_path = _scan_archive_refs_dir(exchange_id, instance_id, payload.get("runDate")) / f"{payload.get('scanId')}.json"
+    write_json(ref_path, ref_payload)
+    return {
+        "sharedPath": shared_path,
+        "refPath": ref_path,
+        "sharedCreated": shared_created,
+    }
+
+
+def read_latest_scan(exchange_id: str | None = None, instance_id: str | None = None) -> dict[str, Any]:
+    if exchange_id is None:
+        settings = read_trading_settings(instance_id)
+        exchange_id = settings.get("activeExchange")
+    normalized = normalize_exchange_id(exchange_id, capability="market")
+    payload = read_json(_latest_scan_path(normalized, instance_id), None)
+    if not instance_id and not isinstance(payload, dict) and normalized == DEFAULT_EXCHANGE_ID:
         payload = read_json(LEGACY_LATEST_SCAN_PATH, {})
     if isinstance(payload, dict):
         return {
@@ -83,14 +195,16 @@ def _split_valid_candidate_symbols(raw_symbols: Any, exchange_id: str | None = N
     invalid: list[str] = []
     for symbol in normalized:
         if gateway.validate_symbol(symbol):
-            valid.append(symbol)
+            resolved_symbol = gateway.normalize_symbol(symbol)
+            if resolved_symbol not in valid:
+                valid.append(resolved_symbol)
         else:
             invalid.append(symbol)
     return valid, invalid
 
 
-def dynamic_candidate_source_enabled(universe: dict[str, Any] | None = None) -> bool:
-    universe = universe or read_fixed_universe()
+def dynamic_candidate_source_enabled(universe: dict[str, Any] | None = None, instance_id: str | None = None) -> bool:
+    universe = universe or read_fixed_universe(instance_id)
     return universe.get("dynamicSource", {}).get("enabled") is True
 
 
@@ -98,8 +212,9 @@ def resolve_candidate_symbols(
     universe: dict[str, Any] | None = None,
     code_override: str | None = None,
     exchange_id: str | None = None,
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
-    universe = universe or read_fixed_universe()
+    universe = universe or read_fixed_universe(instance_id)
     gateway = get_active_exchange_gateway(exchange_id)
     dynamic_source = universe.get("dynamicSource", {}) if isinstance(universe.get("dynamicSource"), dict) else {}
     if dynamic_source.get("enabled") is not True:
@@ -118,9 +233,9 @@ def resolve_candidate_symbols(
             "functionName": dynamic_source.get("functionName") or "load_candidate_symbols",
         }
 
-    source_code = str(code_override if code_override is not None else read_candidate_source_code())
+    source_code = str(code_override if code_override is not None else read_candidate_source_code(instance_id))
     function_name = str(dynamic_source.get("functionName") or "load_candidate_symbols").strip() or "load_candidate_symbols"
-    latest_scan_path = str(_latest_scan_path(gateway.exchange_id))
+    latest_scan_path = str(_latest_scan_path(gateway.exchange_id, instance_id))
     scope: dict[str, Any] = {
         "__builtins__": __builtins__,
         "scan_path": latest_scan_path,
@@ -131,7 +246,7 @@ def resolve_candidate_symbols(
         "config_dir": str(CONFIG_DIR),
         "data_dir": str(DATA_DIR),
         "manual_symbols": list(universe.get("symbols", [])),
-        "network_settings": read_network_settings(),
+        "network_settings": read_network_settings(instance_id),
         "run_date": current_run_date(),
         "now_iso": now_iso(),
         "active_exchange": gateway.exchange_id,
@@ -172,8 +287,9 @@ def test_candidate_source(
     universe: dict[str, Any] | None = None,
     code_override: str | None = None,
     exchange_id: str | None = None,
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
-    resolved = resolve_candidate_symbols(universe=universe, code_override=code_override, exchange_id=exchange_id)
+    resolved = resolve_candidate_symbols(universe=universe, code_override=code_override, exchange_id=exchange_id, instance_id=instance_id)
     return {
         "mode": resolved["mode"],
         "enabled": resolved["enabled"],
@@ -315,11 +431,11 @@ def bucket_for_score(score: float, price_change_pct: float, quote_volume: float,
     return "No trade"
 
 
-def refresh_candidate_pool(exchange_id: str | None = None) -> dict[str, Any]:
+def refresh_candidate_pool(exchange_id: str | None = None, instance_id: str | None = None) -> dict[str, Any]:
     gateway = get_active_exchange_gateway(exchange_id)
-    universe = read_fixed_universe()
+    universe = read_fixed_universe(instance_id)
     thresholds = SCAN_BUCKET_LIMITS
-    resolved_source = resolve_candidate_symbols(universe=universe, exchange_id=gateway.exchange_id)
+    resolved_source = resolve_candidate_symbols(universe=universe, exchange_id=gateway.exchange_id, instance_id=instance_id)
     symbols = resolved_source["symbols"]
     if not symbols:
         raise RuntimeError("config/fixed_universe.json does not contain any symbols.")
@@ -332,10 +448,11 @@ def refresh_candidate_pool(exchange_id: str | None = None) -> dict[str, Any]:
     opportunities: list[dict[str, Any]] = []
     skipped_symbols: list[str] = []
     for symbol in symbols:
-        ticker = ticker_by_symbol.get(symbol, {})
-        premium_row = premium_by_symbol.get(symbol, {})
+        resolved_symbol = gateway.normalize_symbol(symbol)
+        ticker = ticker_by_symbol.get(resolved_symbol, {})
+        premium_row = premium_by_symbol.get(resolved_symbol, {})
         if not ticker and not premium_row:
-            skipped_symbols.append(symbol)
+            skipped_symbols.append(resolved_symbol)
             continue
         last_price = num(ticker.get("lastPrice")) or num(premium_row.get("markPrice")) or 0
         high_price = num(ticker.get("highPrice")) or last_price
@@ -369,8 +486,8 @@ def refresh_candidate_pool(exchange_id: str | None = None) -> dict[str, Any]:
             flags.append("light_liquidity")
         opportunities.append(
             {
-                "symbol": symbol,
-                "baseAsset": gateway.base_asset_from_symbol(symbol),
+                "symbol": resolved_symbol,
+                "baseAsset": gateway.base_asset_from_symbol(resolved_symbol),
                 "score": round(score, 2),
                 "actionBucket": action_bucket,
                 "directionalBias": bias,
@@ -392,6 +509,7 @@ def refresh_candidate_pool(exchange_id: str | None = None) -> dict[str, Any]:
     opportunities.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
     payload = {
         "version": 1,
+        "scanId": f"scan-{int(time.time() * 1000)}",
         "runDate": current_run_date(),
         "fetchedAt": __import__("datetime").datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "source": resolved_source["mode"],
@@ -409,8 +527,9 @@ def refresh_candidate_pool(exchange_id: str | None = None) -> dict[str, Any]:
         },
         "opportunities": opportunities,
     }
-    write_json(_latest_scan_path(gateway.exchange_id), payload)
-    if gateway.exchange_id == DEFAULT_EXCHANGE_ID:
+    write_json(_latest_scan_path(gateway.exchange_id, instance_id), payload)
+    archive_scan(payload, gateway.exchange_id, instance_id)
+    if not instance_id and gateway.exchange_id == DEFAULT_EXCHANGE_ID:
         write_json(LEGACY_LATEST_SCAN_PATH, payload)
     return payload
 
@@ -507,6 +626,8 @@ def normalize_prompt_kline_feeds(raw_feeds: Any) -> dict[str, dict[str, Any]]:
         }
         if not current:
             normalized[interval]["limit"] = PROMPT_KLINE_FETCH_SPECS[interval]["limit"]
+    if not any(item["enabled"] for item in normalized.values()):
+        normalized["15m"]["enabled"] = True
     return normalized
 
 

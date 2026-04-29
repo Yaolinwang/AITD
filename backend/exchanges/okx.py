@@ -40,10 +40,31 @@ class OkxGateway(ExchangeGateway):
     def normalize_symbol(self, symbol: str) -> str:
         normalized = str(symbol or "").strip().upper().replace("_", "-").replace("/", "-")
         normalized = re.sub(r"-{2,}", "-", normalized)
+        if normalized.endswith("-USDT-SWAP"):
+            return normalized
+        if normalized.endswith("-USDT"):
+            return f"{normalized}-SWAP"
+        if normalized.endswith("USDT") and "-" not in normalized and len(normalized) > 4:
+            base = normalized[:-4]
+            if base:
+                return f"{base}-USDT-SWAP"
         return normalized
 
     def validate_symbol(self, symbol: str) -> bool:
-        return bool(self.symbol_pattern.fullmatch(self.normalize_symbol(symbol)))
+        normalized = self.normalize_symbol(symbol)
+        if not self.symbol_pattern.fullmatch(normalized):
+            return False
+        try:
+            instruments = self._instruments()
+            if instruments:
+                return any(
+                    self.normalize_symbol(item.get("instId")) == normalized
+                    for item in instruments
+                    if isinstance(item, dict)
+                )
+        except Exception:
+            pass
+        return True
 
     def base_asset_from_symbol(self, symbol: str) -> str:
         normalized = self.normalize_symbol(symbol)
@@ -89,8 +110,26 @@ class OkxGateway(ExchangeGateway):
             raise ValueError(f"Unexpected OKX response for {endpoint}.")
         code = str(payload.get("code") or "")
         if code not in {"", "0"}:
-            raise ValueError(f"OKX {endpoint} failed: {payload.get('msg') or code}")
+            data_rows = payload.get("data") if isinstance(payload.get("data"), list) else []
+            row_message = ""
+            row_code = ""
+            if data_rows and isinstance(data_rows[0], dict):
+                row_code = str(data_rows[0].get("sCode") or "").strip()
+                row_message = str(data_rows[0].get("sMsg") or "").strip()
+            message = row_message or str(payload.get("msg") or code).strip() or code
+            if code == "50105":
+                raise ValueError("OKX API passphrase is incorrect for this API key.")
+            if code == "50111":
+                raise ValueError("OKX API key is invalid.")
+            if code == "50113":
+                raise ValueError("OKX API signature is invalid. Please re-check API secret and request signing.")
+            if row_code:
+                raise ValueError(f"OKX {endpoint} failed: {row_code} {message}".strip())
+            raise ValueError(f"OKX {endpoint} failed: {message}")
         return payload.get("data")
+
+    def _credential(self, config: dict[str, Any], key: str) -> str:
+        return str(config.get(key) or "").strip()
 
     def _public_get_data(
         self,
@@ -135,16 +174,16 @@ class OkxGateway(ExchangeGateway):
         prehash = f"{timestamp}{method_upper}{request_path}{body_text}"
         signature = base64.b64encode(
             hmac.new(
-                str(config["apiSecret"]).encode("utf-8"),
+                self._credential(config, "apiSecret").encode("utf-8"),
                 prehash.encode("utf-8"),
                 hashlib.sha256,
             ).digest()
         ).decode("utf-8")
         headers = {
-            "OK-ACCESS-KEY": str(config["apiKey"]),
+            "OK-ACCESS-KEY": self._credential(config, "apiKey"),
             "OK-ACCESS-SIGN": signature,
             "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": str(config["apiPassphrase"]),
+            "OK-ACCESS-PASSPHRASE": self._credential(config, "apiPassphrase"),
             "Content-Type": "application/json",
         }
         payload = request_json(
@@ -563,8 +602,10 @@ class OkxGateway(ExchangeGateway):
         *,
         symbol: str,
         position_side: str,
+        quantity: float | None = None,
         stop_loss: float | None,
         take_profit: float | None,
+        take_profit_fraction: float | None = None,
     ) -> list[dict[str, Any]]:
         created: list[dict[str, Any]] = []
         if stop_loss is None and take_profit is None:
@@ -577,11 +618,11 @@ class OkxGateway(ExchangeGateway):
             "side": close_side,
             "ordType": "conditional",
             "posSide": "net",
-            "closeFraction": "1",
         }
         if stop_loss is not None:
             payload = {
                 **base_payload,
+                "closeFraction": "1",
                 "slTriggerPx": self._format_number(self.normalize_price(config, normalized, stop_loss)),
                 "slTriggerPxType": "mark",
                 "slOrdPx": "-1",
@@ -590,12 +631,22 @@ class OkxGateway(ExchangeGateway):
             if isinstance(rows, list):
                 created.extend(rows)
         if take_profit is not None:
+            tp_fraction = max(0.05, min(1.0, num(take_profit_fraction) or 1.0))
             payload = {
                 **base_payload,
                 "tpTriggerPx": self._format_number(self.normalize_price(config, normalized, take_profit)),
                 "tpTriggerPxType": "mark",
                 "tpOrdPx": "-1",
             }
+            if tp_fraction < 0.999 and quantity is not None:
+                tp_quantity = self.normalize_quantity(
+                    config,
+                    normalized,
+                    quantity=max(0.0, float(quantity) * tp_fraction),
+                )
+                payload["sz"] = self._format_number(tp_quantity)
+            else:
+                payload["closeFraction"] = "1"
             rows = self._signed_request_json(config, "POST", "/api/v5/trade/order-algo", body=payload)
             if isinstance(rows, list):
                 created.extend(rows)

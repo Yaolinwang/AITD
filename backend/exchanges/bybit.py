@@ -257,7 +257,9 @@ class BybitGateway(ExchangeGateway):
         *,
         symbol: str,
         position_side: str,
+        quantity: float | None = None,
         stop_loss: float | None,
         take_profit: float | None,
+        take_profit_fraction: float | None = None,
     ) -> list[dict[str, Any]]:
         raise NotImplementedError("Bybit live trading is not wired in yet.")

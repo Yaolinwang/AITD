@@ -62,12 +62,23 @@ def place_market_order(config: dict[str, Any], *, symbol: str, side: str, quanti
     )
 
 
-def place_protection_orders(config: dict[str, Any], *, symbol: str, position_side: str, stop_loss: float | None, take_profit: float | None) -> list[dict[str, Any]]:
+def place_protection_orders(
+    config: dict[str, Any],
+    *,
+    symbol: str,
+    position_side: str,
+    quantity: float | None = None,
+    stop_loss: float | None,
+    take_profit: float | None,
+    take_profit_fraction: float | None = None,
+) -> list[dict[str, Any]]:
     gateway = get_live_exchange_gateway(config)
     return gateway.place_protection_orders(
         config,
         symbol=symbol,
         position_side=position_side,
+        quantity=quantity,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        take_profit_fraction=take_profit_fraction,
     )

@@ -20,6 +20,15 @@ PROMPT_SETTINGS_PATH = CONFIG_DIR / "trading_prompt.json"
 PROMPT_LIBRARY_PATH = CONFIG_DIR / "trading_prompt_library.json"
 
 
+def _instance_path(instance_id: str | None, key: str, legacy_path: Path) -> Path:
+    if not instance_id:
+        return legacy_path
+    from .instances import ensure_instances_migrated, instance_paths
+
+    ensure_instances_migrated()
+    return instance_paths(instance_id)[key]
+
+
 DEFAULT_TRADING_SETTINGS = {
     "version": 2,
     "updated": "2026-04-20",
@@ -47,6 +56,12 @@ DEFAULT_TRADING_SETTINGS = {
     "liveTrading": {
         "enabled": False,
     },
+    "selfLearning": {
+        "enabled": False,
+        "maxLessons": 5,
+        "lookbackDecisions": 300,
+        "reviewHorizonHours": 4,
+    },
     "liveExecution": {
         "configPath": "config/live_trading.json",
         "useExchangeProtectionOrders": True,
@@ -59,7 +74,7 @@ DEFAULT_DASHBOARD_SETTINGS = {
     "version": 1,
     "updated": "2026-04-20",
     "timezone": "Asia/Shanghai",
-    "pageAutoRefreshSeconds": 600,
+    "pageAutoRefreshSeconds": 30,
     "marketAutoScanEnabled": True,
     "marketScanIntervalMinutes": 60,
     "marketScanOffsetMinute": 7,
@@ -96,6 +111,7 @@ DEFAULT_PROVIDER_SETTINGS = {
     "timeoutSeconds": 45,
     "temperature": 0.2,
     "maxOutputTokens": 1200,
+    "bypassProxy": False,
     "anthropicVersion": "2023-06-01",
     "customHeaders": {},
 }
@@ -118,23 +134,8 @@ DEFAULT_FIXED_UNIVERSE_SETTINGS = {
         "BTCUSDT",
         "ETHUSDT",
         "SOLUSDT",
-        "SUIUSDT",
         "DOGEUSDT",
         "1000PEPEUSDT",
-        "ENAUSDT",
-        "WIFUSDT",
-        "ARKMUSDT",
-        "BLURUSDT",
-        "API3USDT",
-        "ZECUSDT",
-        "ONDOUSDT",
-        "ARBUSDT",
-        "LINKUSDT",
-        "AAVEUSDT",
-        "CRVUSDT",
-        "FETUSDT",
-        "PENDLEUSDT",
-        "TIAUSDT",
     ],
     "dynamicSource": {
         "enabled": False,
@@ -193,6 +194,10 @@ PROVIDER_PRESET_MAP = {
         "apiStyle": "openai",
         "baseUrl": "https://api.openai.com/v1",
     },
+    "kimi": {
+        "apiStyle": "openai",
+        "baseUrl": "https://api.moonshot.ai/v1",
+    },
     "deepseek": {
         "apiStyle": "openai",
         "baseUrl": "https://api.deepseek.com/v1",
@@ -231,13 +236,14 @@ def _with_default_text_file(path: Path, default_text: str) -> str:
         return default_text.rstrip() + "\n"
 
 
-def read_trading_settings() -> dict[str, Any]:
-    payload = _with_default_file(TRADING_SETTINGS_PATH, DEFAULT_TRADING_SETTINGS)
+def read_trading_settings(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "trading_settings", TRADING_SETTINGS_PATH), DEFAULT_TRADING_SETTINGS)
     normalized_payload = {key: value for key, value in payload.items() if key in DEFAULT_TRADING_SETTINGS}
     live_settings = payload.get("liveExecution") if isinstance(payload.get("liveExecution"), dict) else {}
     server_settings = payload.get("server") if isinstance(payload.get("server"), dict) else {}
     paper_trading = payload.get("paperTrading") if isinstance(payload.get("paperTrading"), dict) else {}
     live_trading = payload.get("liveTrading") if isinstance(payload.get("liveTrading"), dict) else {}
+    self_learning = payload.get("selfLearning") if isinstance(payload.get("selfLearning"), dict) else {}
     return {
         **deepcopy(DEFAULT_TRADING_SETTINGS),
         **normalized_payload,
@@ -265,6 +271,14 @@ def read_trading_settings() -> dict[str, Any]:
             **live_trading,
             "enabled": clean_bool(live_trading.get("enabled"), DEFAULT_TRADING_SETTINGS["liveTrading"]["enabled"]),
         },
+        "selfLearning": {
+            **deepcopy(DEFAULT_TRADING_SETTINGS["selfLearning"]),
+            **self_learning,
+            "enabled": clean_bool(self_learning.get("enabled"), DEFAULT_TRADING_SETTINGS["selfLearning"]["enabled"]),
+            "maxLessons": int(clamp(self_learning.get("maxLessons", DEFAULT_TRADING_SETTINGS["selfLearning"]["maxLessons"]), 1, 10)),
+            "lookbackDecisions": int(clamp(self_learning.get("lookbackDecisions", DEFAULT_TRADING_SETTINGS["selfLearning"]["lookbackDecisions"]), 20, 2000)),
+            "reviewHorizonHours": int(clamp(self_learning.get("reviewHorizonHours", DEFAULT_TRADING_SETTINGS["selfLearning"]["reviewHorizonHours"]), 1, 72)),
+        },
         "server": {
             "host": str(server_settings.get("host") or DEFAULT_TRADING_SETTINGS["server"]["host"]),
             "port": int(clamp(server_settings.get("port"), 1024, 65535)),
@@ -280,13 +294,14 @@ def read_trading_settings() -> dict[str, Any]:
     }
 
 
-def write_trading_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_trading_settings()
+def write_trading_settings(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_trading_settings(instance_id)
     normalized_patch = {key: value for key, value in patch.items() if key in current}
     live_patch = patch.get("liveExecution") if isinstance(patch.get("liveExecution"), dict) else {}
     server_patch = patch.get("server") if isinstance(patch.get("server"), dict) else {}
     paper_trading_patch = patch.get("paperTrading") if isinstance(patch.get("paperTrading"), dict) else {}
     live_trading_patch = patch.get("liveTrading") if isinstance(patch.get("liveTrading"), dict) else {}
+    self_learning_patch = patch.get("selfLearning") if isinstance(patch.get("selfLearning"), dict) else {}
     next_payload = {
         **current,
         **normalized_patch,
@@ -314,6 +329,14 @@ def write_trading_settings(patch: dict[str, Any]) -> dict[str, Any]:
             **live_trading_patch,
             "enabled": clean_bool(live_trading_patch.get("enabled"), current["liveTrading"]["enabled"]),
         },
+        "selfLearning": {
+            **current["selfLearning"],
+            **self_learning_patch,
+            "enabled": clean_bool(self_learning_patch.get("enabled"), current["selfLearning"]["enabled"]),
+            "maxLessons": int(clamp(self_learning_patch.get("maxLessons", current["selfLearning"]["maxLessons"]), 1, 10)),
+            "lookbackDecisions": int(clamp(self_learning_patch.get("lookbackDecisions", current["selfLearning"]["lookbackDecisions"]), 20, 2000)),
+            "reviewHorizonHours": int(clamp(self_learning_patch.get("reviewHorizonHours", current["selfLearning"]["reviewHorizonHours"]), 1, 72)),
+        },
         "server": {
             "host": str(server_patch.get("host") or current["server"]["host"]),
             "port": int(clamp(server_patch.get("port", current["server"]["port"]), 1024, 65535)),
@@ -327,7 +350,7 @@ def write_trading_settings(patch: dict[str, Any]) -> dict[str, Any]:
             ),
         },
     }
-    write_json(TRADING_SETTINGS_PATH, next_payload)
+    write_json(_instance_path(instance_id, "trading_settings", TRADING_SETTINGS_PATH), next_payload)
     return next_payload
 
 
@@ -359,14 +382,15 @@ def write_dashboard_settings(patch: dict[str, Any]) -> dict[str, Any]:
     return next_payload
 
 
-def read_candidate_source_code() -> str:
-    return _with_default_text_file(CANDIDATE_SOURCE_PATH, DEFAULT_CANDIDATE_SOURCE_CODE)
+def read_candidate_source_code(instance_id: str | None = None) -> str:
+    return _with_default_text_file(_instance_path(instance_id, "candidate_source", CANDIDATE_SOURCE_PATH), DEFAULT_CANDIDATE_SOURCE_CODE)
 
 
-def write_candidate_source_code(code: str) -> str:
+def write_candidate_source_code(code: str, instance_id: str | None = None) -> str:
     text = str(code or "").rstrip() + "\n"
-    CANDIDATE_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CANDIDATE_SOURCE_PATH.write_text(text, encoding="utf-8")
+    path = _instance_path(instance_id, "candidate_source", CANDIDATE_SOURCE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
     return text
 
 
@@ -402,9 +426,9 @@ def _merged_fixed_universe_payload(current: dict[str, Any], patch: dict[str, Any
     }
 
 
-def read_fixed_universe() -> dict[str, Any]:
-    payload = _with_default_file(FIXED_UNIVERSE_PATH, DEFAULT_FIXED_UNIVERSE_SETTINGS)
-    _ = read_candidate_source_code()
+def read_fixed_universe(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "fixed_universe", FIXED_UNIVERSE_PATH), DEFAULT_FIXED_UNIVERSE_SETTINGS)
+    _ = read_candidate_source_code(instance_id)
     payload_without_scoring = {key: value for key, value in payload.items() if key != "scoring"}
     symbols = _normalized_symbol_values(payload.get("symbols", []), DEFAULT_FIXED_UNIVERSE_SETTINGS["symbols"])
     dynamic_source = payload.get("dynamicSource") if isinstance(payload.get("dynamicSource"), dict) else {}
@@ -425,16 +449,16 @@ def read_fixed_universe() -> dict[str, Any]:
     }
 
 
-def preview_fixed_universe(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_fixed_universe()
+def preview_fixed_universe(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_fixed_universe(instance_id)
     return _merged_fixed_universe_payload(current, patch)
 
 
-def write_fixed_universe(patch: dict[str, Any]) -> dict[str, Any]:
-    next_payload = preview_fixed_universe(patch)
+def write_fixed_universe(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    next_payload = preview_fixed_universe(patch, instance_id)
     if "candidateSourceCode" in patch:
-        write_candidate_source_code(str(patch.get("candidateSourceCode") or ""))
-    write_json(FIXED_UNIVERSE_PATH, next_payload)
+        write_candidate_source_code(str(patch.get("candidateSourceCode") or ""), instance_id)
+    write_json(_instance_path(instance_id, "fixed_universe", FIXED_UNIVERSE_PATH), next_payload)
     return next_payload
 
 
@@ -442,8 +466,15 @@ def _normalized_provider_defaults(preset: str) -> dict[str, Any]:
     return PROVIDER_PRESET_MAP.get(preset, PROVIDER_PRESET_MAP["custom"])
 
 
-def read_llm_provider() -> dict[str, Any]:
-    payload = _with_default_file(LLM_PROVIDER_PATH, DEFAULT_PROVIDER_SETTINGS)
+def _normalized_api_key(value: Any) -> str:
+    text = str(value or "").strip().strip('"').strip("'")
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    return text
+
+
+def read_llm_provider(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "llm_provider", LLM_PROVIDER_PATH), DEFAULT_PROVIDER_SETTINGS)
     preset = str(payload.get("preset") or DEFAULT_PROVIDER_SETTINGS["preset"]).strip().lower()
     preset_defaults = _normalized_provider_defaults(preset)
     base_url = str(payload.get("baseUrl") or preset_defaults["baseUrl"] or "").strip()
@@ -458,17 +489,18 @@ def read_llm_provider() -> dict[str, Any]:
         "apiStyle": api_style,
         "model": str(payload.get("model") or DEFAULT_PROVIDER_SETTINGS["model"]).strip(),
         "baseUrl": base_url,
-        "apiKey": str(payload.get("apiKey") or ""),
+        "apiKey": _normalized_api_key(payload.get("apiKey")),
         "timeoutSeconds": int(clamp(payload.get("timeoutSeconds"), 10, 180)),
         "temperature": clamp(payload.get("temperature"), 0, 1.5),
         "maxOutputTokens": int(clamp(payload.get("maxOutputTokens"), 256, 4096)),
+        "bypassProxy": clean_bool(payload.get("bypassProxy"), False),
         "anthropicVersion": str(payload.get("anthropicVersion") or DEFAULT_PROVIDER_SETTINGS["anthropicVersion"]),
         "customHeaders": payload.get("customHeaders") if isinstance(payload.get("customHeaders"), dict) else {},
     }
 
 
-def write_llm_provider(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_llm_provider()
+def write_llm_provider(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_llm_provider(instance_id)
     preset = str(patch.get("preset", current["preset"])).strip().lower()
     if preset not in PROVIDER_PRESET_MAP:
         preset = "custom"
@@ -484,19 +516,20 @@ def write_llm_provider(patch: dict[str, Any]) -> dict[str, Any]:
         "apiStyle": api_style,
         "baseUrl": str(patch.get("baseUrl") or current.get("baseUrl") or preset_defaults["baseUrl"]).strip(),
         "model": str(patch.get("model") or current["model"]).strip(),
-        "apiKey": str(patch.get("apiKey", current["apiKey"])),
+        "apiKey": _normalized_api_key(patch.get("apiKey", current["apiKey"])),
         "timeoutSeconds": int(clamp(patch.get("timeoutSeconds", current["timeoutSeconds"]), 10, 180)),
         "temperature": clamp(patch.get("temperature", current["temperature"]), 0, 1.5),
         "maxOutputTokens": int(clamp(patch.get("maxOutputTokens", current["maxOutputTokens"]), 256, 4096)),
+        "bypassProxy": clean_bool(patch.get("bypassProxy", current["bypassProxy"]), False),
         "anthropicVersion": str(patch.get("anthropicVersion", current["anthropicVersion"])),
         "customHeaders": patch.get("customHeaders") if isinstance(patch.get("customHeaders"), dict) else current["customHeaders"],
     }
-    write_json(LLM_PROVIDER_PATH, next_payload)
+    write_json(_instance_path(instance_id, "llm_provider", LLM_PROVIDER_PATH), next_payload)
     return next_payload
 
 
-def read_network_settings() -> dict[str, Any]:
-    payload = _with_default_file(NETWORK_SETTINGS_PATH, DEFAULT_NETWORK_SETTINGS)
+def read_network_settings(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "network", NETWORK_SETTINGS_PATH), DEFAULT_NETWORK_SETTINGS)
     no_proxy = payload.get("noProxy")
     if isinstance(no_proxy, str):
         normalized_no_proxy = [item.strip() for item in no_proxy.split(",") if item.strip()]
@@ -514,8 +547,8 @@ def read_network_settings() -> dict[str, Any]:
     }
 
 
-def write_network_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_network_settings()
+def write_network_settings(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_network_settings(instance_id)
     no_proxy = patch.get("noProxy", current["noProxy"])
     if isinstance(no_proxy, str):
         normalized_no_proxy = [item.strip() for item in no_proxy.split(",") if item.strip()]
@@ -531,7 +564,7 @@ def write_network_settings(patch: dict[str, Any]) -> dict[str, Any]:
         "proxyUrl": str(patch.get("proxyUrl", current["proxyUrl"])).strip(),
         "noProxy": normalized_no_proxy,
     }
-    write_json(NETWORK_SETTINGS_PATH, next_payload)
+    write_json(_instance_path(instance_id, "network", NETWORK_SETTINGS_PATH), next_payload)
     return next_payload
 
 
@@ -539,8 +572,8 @@ def read_live_exchange_catalog() -> list[dict[str, Any]]:
     return exchange_catalog_payload()
 
 
-def read_live_trading_config() -> dict[str, Any]:
-    payload = _with_default_file(LIVE_TRADING_PATH, DEFAULT_LIVE_TRADING_SETTINGS)
+def read_live_trading_config(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "live_trading", LIVE_TRADING_PATH), DEFAULT_LIVE_TRADING_SETTINGS)
     normalized_payload = {key: value for key, value in payload.items() if key in DEFAULT_LIVE_TRADING_SETTINGS}
     exchange_id = normalize_exchange_id(payload.get("exchange"), capability="trade")
     exchange_meta = exchange_config(exchange_id)
@@ -566,8 +599,8 @@ def read_live_trading_config() -> dict[str, Any]:
     }
 
 
-def write_live_trading_config(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_live_trading_config()
+def write_live_trading_config(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_live_trading_config(instance_id)
     normalized_patch = {key: value for key, value in patch.items() if key in current}
     exchange_id = normalize_exchange_id(patch.get("exchange", current["exchange"]), capability="trade")
     exchange_meta = exchange_config(exchange_id)
@@ -594,7 +627,7 @@ def write_live_trading_config(patch: dict[str, Any]) -> dict[str, Any]:
         "baseUrl": requested_base_url,
         "note": str(patch.get("note", current["note"])),
     }
-    write_json(LIVE_TRADING_PATH, next_payload)
+    write_json(_instance_path(instance_id, "live_trading", LIVE_TRADING_PATH), next_payload)
     return next_payload
 
 
@@ -608,6 +641,9 @@ def _normalized_prompt_kline_feeds(raw_feeds: Any, legacy_intervals: Any = None)
                 "enabled": clean_bool(current.get("enabled"), defaults[interval]["enabled"]),
                 "limit": int(clamp(current.get("limit"), 1, 300)),
             }
+        if any(item["enabled"] for item in normalized.values()):
+            return normalized
+        normalized["15m"]["enabled"] = True
         return normalized
     enabled_from_legacy: set[str] = set()
     if isinstance(legacy_intervals, str):
@@ -626,8 +662,8 @@ def _normalized_prompt_kline_feeds(raw_feeds: Any, legacy_intervals: Any = None)
     return normalized
 
 
-def read_prompt_settings() -> dict[str, Any]:
-    payload = _with_default_file(PROMPT_SETTINGS_PATH, DEFAULT_PROMPT_SETTINGS)
+def read_prompt_settings(instance_id: str | None = None) -> dict[str, Any]:
+    payload = _with_default_file(_instance_path(instance_id, "prompt", PROMPT_SETTINGS_PATH), DEFAULT_PROMPT_SETTINGS)
     decision_logic = payload.get("decision_logic")
     if not isinstance(decision_logic, dict):
         decision_logic = deepcopy(DEFAULT_PROMPT_SETTINGS["decision_logic"])
@@ -642,8 +678,8 @@ def read_prompt_settings() -> dict[str, Any]:
     }
 
 
-def write_prompt_settings(patch: dict[str, Any]) -> dict[str, Any]:
-    current = read_prompt_settings()
+def write_prompt_settings(patch: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
+    current = read_prompt_settings(instance_id)
     next_payload = {
         **current,
         **patch,
@@ -653,7 +689,7 @@ def write_prompt_settings(patch: dict[str, Any]) -> dict[str, Any]:
         "klineFeeds": _normalized_prompt_kline_feeds(patch.get("klineFeeds", current["klineFeeds"])),
         "decision_logic": patch.get("decision_logic") if isinstance(patch.get("decision_logic"), dict) else current["decision_logic"],
     }
-    write_json(PROMPT_SETTINGS_PATH, next_payload)
+    write_json(_instance_path(instance_id, "prompt", PROMPT_SETTINGS_PATH), next_payload)
     return next_payload
 
 
@@ -684,11 +720,34 @@ def _normalized_prompt_preset(payload: dict[str, Any], *, preset_id: str | None 
     }
 
 
-def read_prompt_library() -> dict[str, Any]:
+def _prompt_preset_signature(payload: dict[str, Any]) -> str:
+    normalized = _normalized_prompt_preset(payload)
+    comparable = {
+        "name": normalized.get("name"),
+        "klineFeeds": normalized.get("klineFeeds"),
+        "decision_logic": normalized.get("decision_logic"),
+    }
+    import json
+
+    return json.dumps(comparable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def read_prompt_library(instance_id: str | None = None) -> dict[str, Any]:
     payload = _with_default_file(PROMPT_LIBRARY_PATH, DEFAULT_PROMPT_LIBRARY_SETTINGS)
+    raw_prompts: list[Any] = list(payload.get("prompts") if isinstance(payload.get("prompts"), list) else [])
+    try:
+        from .instances import instance_paths, list_instances
+
+        for instance in list_instances():
+            extra_payload = read_json(instance_paths(instance["id"])["prompt_library"], None)
+            if not isinstance(extra_payload, dict):
+                continue
+            extra_prompts = extra_payload.get("prompts") if isinstance(extra_payload.get("prompts"), list) else []
+            raw_prompts.extend(extra_prompts)
+    except Exception:
+        pass
     prompts: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    raw_prompts = payload.get("prompts") if isinstance(payload.get("prompts"), list) else []
     for index, item in enumerate(raw_prompts):
         if not isinstance(item, dict):
             continue
@@ -708,7 +767,7 @@ def read_prompt_library() -> dict[str, Any]:
     }
 
 
-def _write_prompt_library_payload(prompts: list[dict[str, Any]]) -> dict[str, Any]:
+def _write_prompt_library_payload(prompts: list[dict[str, Any]], instance_id: str | None = None) -> dict[str, Any]:
     payload = {
         "version": DEFAULT_PROMPT_LIBRARY_SETTINGS["version"],
         "updated": current_run_date(),
@@ -718,20 +777,53 @@ def _write_prompt_library_payload(prompts: list[dict[str, Any]]) -> dict[str, An
     return read_prompt_library()
 
 
-def save_prompt_preset(payload: dict[str, Any]) -> dict[str, Any]:
+def save_prompt_preset(payload: dict[str, Any], instance_id: str | None = None) -> dict[str, Any]:
     library = read_prompt_library()
     prompts = list(library["prompts"])
     requested_id = str(payload.get("id") or payload.get("presetId") or "").strip()
+    requested_name = _prompt_preset_name(payload.get("name"), DEFAULT_PROMPT_SETTINGS["name"])
+    incoming_signature = _prompt_preset_signature(payload)
     if requested_id:
         existing = next((item for item in prompts if item["id"] == requested_id), None)
-        if not existing:
-            raise ValueError(f"Prompt preset not found: {requested_id}")
-        preset = _normalized_prompt_preset(payload, preset_id=requested_id)
-        for index, item in enumerate(prompts):
-            if item["id"] == requested_id:
-                prompts[index] = preset
-                break
-    else:
+        if existing:
+            preset = _normalized_prompt_preset(payload, preset_id=requested_id)
+            for index, item in enumerate(prompts):
+                if item["id"] == requested_id:
+                    prompts[index] = preset
+                    break
+        else:
+            requested_id = ""
+    if not requested_id:
+        same_name_prompts = [item for item in prompts if _prompt_preset_name(item.get("name")) == requested_name]
+        if same_name_prompts:
+            # Same-name save should behave like updating the existing prompt instead of
+            # creating another duplicate card every time the user clicks save.
+            target = max(same_name_prompts, key=lambda item: str(item.get("updatedAt") or ""))
+            requested_id = str(target.get("id") or "").strip()
+            preset = _normalized_prompt_preset(payload, preset_id=requested_id)
+            for index, item in enumerate(prompts):
+                if item["id"] == requested_id:
+                    prompts[index] = preset
+                    break
+        else:
+            duplicate = next(
+                (
+                    item for item in prompts
+                    if _prompt_preset_signature(item) == incoming_signature
+                ),
+                None,
+            )
+            if duplicate:
+                requested_id = str(duplicate.get("id") or "").strip()
+                preset = {
+                    **duplicate,
+                    "updatedAt": now_iso(),
+                }
+                for index, item in enumerate(prompts):
+                    if item["id"] == requested_id:
+                        prompts[index] = preset
+                        break
+    if not requested_id:
         base_slug = _prompt_preset_slug(_prompt_preset_name(payload.get("name"), DEFAULT_PROMPT_SETTINGS["name"]))
         candidate_id = base_slug
         suffix = 2
@@ -749,7 +841,7 @@ def save_prompt_preset(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def read_prompt_preset(preset_id: str) -> dict[str, Any]:
+def read_prompt_preset(preset_id: str, instance_id: str | None = None) -> dict[str, Any]:
     target = str(preset_id or "").strip()
     if not target:
         raise ValueError("Prompt preset id is required.")
@@ -760,7 +852,7 @@ def read_prompt_preset(preset_id: str) -> dict[str, Any]:
     return preset
 
 
-def rename_prompt_preset(preset_id: str, name: str) -> dict[str, Any]:
+def rename_prompt_preset(preset_id: str, name: str, instance_id: str | None = None) -> dict[str, Any]:
     library = read_prompt_library()
     prompts = list(library["prompts"])
     target = str(preset_id or "").strip()
@@ -788,7 +880,7 @@ def rename_prompt_preset(preset_id: str, name: str) -> dict[str, Any]:
     }
 
 
-def delete_prompt_preset(preset_id: str) -> dict[str, Any]:
+def delete_prompt_preset(preset_id: str, instance_id: str | None = None) -> dict[str, Any]:
     library = read_prompt_library()
     prompts = list(library["prompts"])
     target = str(preset_id or "").strip()
